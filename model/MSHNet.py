@@ -109,7 +109,16 @@ class MSHNet(nn.Module):
             layer.append(block(out_channels, out_channels))
         return nn.Sequential(*layer)
 
-    def build_dea_lite_outputs(self, scale_logits, z_full):
+    def build_dea_lite_outputs(self, scale_logits, z_full, detach_evidence=False):
+        if detach_evidence:
+            cf_scale_logits = scale_logits.detach()
+            dec_scale_logits = scale_logits.detach()
+            dec_z_full = z_full.detach()
+        else:
+            cf_scale_logits = scale_logits
+            dec_scale_logits = scale_logits
+            dec_z_full = z_full
+
         if self.final.bias is None:
             z_empty = torch.zeros_like(z_full)
             bias = None
@@ -119,13 +128,13 @@ class MSHNet(nn.Module):
 
         only_weight = self.final.weight.permute(1, 0, 2, 3).contiguous()
         z_only = F.conv2d(
-            scale_logits,
+            cf_scale_logits,
             only_weight,
             bias=None,
             stride=self.final.stride,
             padding=self.final.padding,
             dilation=self.final.dilation,
-            groups=scale_logits.shape[1],
+            groups=cf_scale_logits.shape[1],
         )
         if bias is not None:
             z_only = z_only + bias
@@ -134,10 +143,10 @@ class MSHNet(nn.Module):
         z_only_var = z_only.var(dim=1, keepdim=True, unbiased=False)
 
         d_input = torch.cat([
-            z_full,
-            z_only_max,
-            z_only_var,
-            scale_logits,
+            dec_z_full,
+            z_only_max.detach() if detach_evidence else z_only_max,
+            z_only_var.detach() if detach_evidence else z_only_var,
+            dec_scale_logits,
         ], dim=1)
 
         d_logit = self.decidability_head(d_input)
@@ -151,7 +160,7 @@ class MSHNet(nn.Module):
             "decidability_logit": d_logit,
         }
 
-    def forward(self, x, warm_flag, return_dea=False):
+    def forward(self, x, warm_flag, return_dea=False, dea_detach_evidence=False):
         x_e0 = self.encoder_0(self.conv_init(x))
         x_e1 = self.encoder_1(self.pool(x_e0))
         x_e2 = self.encoder_2(self.pool(x_e1))
@@ -180,7 +189,11 @@ class MSHNet(nn.Module):
             z_full = self.final(scale_logits)
 
             if return_dea:
-                dea_out = self.build_dea_lite_outputs(scale_logits, z_full)
+                dea_out = self.build_dea_lite_outputs(
+                    scale_logits,
+                    z_full,
+                    detach_evidence=dea_detach_evidence,
+                )
                 return [mask0, mask1, mask2, mask3], z_full, dea_out
 
             return [mask0, mask1, mask2, mask3], z_full

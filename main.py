@@ -32,6 +32,13 @@ def load_torch_file(path):
     except TypeError:
         return torch.load(path)
 
+def get_dea_ramp(epoch, warm_epoch, ramp_epochs):
+    if ramp_epochs <= 0:
+        return 1.0
+    if epoch <= warm_epoch:
+        return 0.0
+    return min(1.0, float(epoch - warm_epoch) / float(ramp_epochs))
+
 def parse_args():
 
     #
@@ -57,14 +64,15 @@ def parse_args():
     parser.add_argument('--mode', type=str, default='train')
     parser.add_argument('--weight-path', type=str, default=osp.join(DEFAULT_WEIGHT_DIR, 'IRSTD-1k_weight.tar'))
     parser.add_argument('--checkpoint-dir', type=str, default='')
-    parser.add_argument('--dea-lambda-single', type=float, default=0.10)
-    parser.add_argument('--dea-lambda-dec', type=float, default=0.05)
-    parser.add_argument('--dea-lambda-empty', type=float, default=0.01)
-    parser.add_argument('--dea-tau', type=float, default=0.3)
-    parser.add_argument('--dea-ramp-epochs', type=int, default=20)
+    parser.add_argument('--dea-lambda-single', type=float, default=0.0)
+    parser.add_argument('--dea-lambda-dec', type=float, default=0.0)
+    parser.add_argument('--dea-lambda-empty', type=float, default=0.0)
+    parser.add_argument('--dea-tau', type=float, default=0.5)
+    parser.add_argument('--dea-ramp-epochs', type=int, default=0)
     parser.add_argument('--save-dea-debug', action='store_true')
-    parser.add_argument('--dea-debug-interval', type=int, default=20)
+    parser.add_argument('--dea-debug-interval', type=int, default=50)
     parser.add_argument('--dea-debug-max-batches', type=int, default=1)
+    parser.add_argument('--dea-detach-evidence', action='store_true')
 
     args = parser.parse_args()
     return args
@@ -206,18 +214,15 @@ class Trainer(object):
             )
         return osp.dirname(checkpoint_paths[-1])
         
-    def get_dea_loss_weights(self, epoch):
-        if self.args.dea_ramp_epochs <= 0:
-            ratio = 1.0
-        else:
-            ratio = (epoch - self.warm_epoch) / float(self.args.dea_ramp_epochs)
-            ratio = min(1.0, max(0.0, ratio))
-
-        return {
-            "lambda_single": self.args.dea_lambda_single * ratio,
-            "lambda_dec": self.args.dea_lambda_dec * ratio,
-            "lambda_empty": self.args.dea_lambda_empty * ratio,
-        }
+    def use_dea(self, epoch):
+        return (
+            epoch > self.warm_epoch
+            and (
+                self.args.dea_lambda_single > 0
+                or self.args.dea_lambda_dec > 0
+                or self.args.dea_lambda_empty > 0
+            )
+        )
 
     def save_dea_debug(self, epoch, iteration, data, labels, pred, dea_out):
         if not self.args.save_dea_debug:
@@ -259,9 +264,15 @@ class Trainer(object):
             labels = mask.to(self.device, non_blocking=True)
 
             tag = epoch > self.warm_epoch
+            use_dea = self.use_dea(epoch)
 
-            if tag:
-                masks, pred, dea_out = self.model(data, tag, return_dea=True)
+            if use_dea:
+                masks, pred, dea_out = self.model(
+                    data,
+                    tag,
+                    return_dea=True,
+                    dea_detach_evidence=self.args.dea_detach_evidence,
+                )
             else:
                 masks, pred = self.model(data, tag)
                 dea_out = None
@@ -276,20 +287,40 @@ class Trainer(object):
                 loss = loss + self.loss_fun(masks[j], labels_for_scale, self.warm_epoch, epoch)
                 
             loss = loss / (len(masks)+1)
+            loss_seg_for_debug = loss.detach()
 
-            if tag:
-                dea_weights = self.get_dea_loss_weights(epoch)
-                loss_dea, _ = dea_lite_loss(
-                    dea_out,
-                    pred,
-                    labels,
-                    lambda_single=dea_weights["lambda_single"],
-                    lambda_dec=dea_weights["lambda_dec"],
-                    lambda_empty=dea_weights["lambda_empty"],
+            if use_dea:
+                ramp = get_dea_ramp(epoch, self.warm_epoch, self.args.dea_ramp_epochs)
+                cur_lambda_single = self.args.dea_lambda_single * ramp
+                cur_lambda_dec = self.args.dea_lambda_dec * ramp
+                cur_lambda_empty = self.args.dea_lambda_empty * ramp
+
+                loss_dea, dea_log = dea_lite_loss(
+                    dea_out=dea_out,
+                    z_full=pred,
+                    gt=labels,
+                    lambda_single=cur_lambda_single,
+                    lambda_dec=cur_lambda_dec,
+                    lambda_empty=cur_lambda_empty,
                     tau=self.args.dea_tau,
                 )
                 loss = loss + loss_dea
                 self.save_dea_debug(epoch, i, data, labels, pred, dea_out)
+
+                if self.args.save_dea_debug and self.args.dea_debug_interval > 0 and i % self.args.dea_debug_interval == 0:
+                    dea_ratio = (loss_dea.detach() / (loss_seg_for_debug + 1e-6)).item()
+                    msg = [
+                        'dea_ratio=%.4f' % dea_ratio,
+                        'lambda_single=%.6f' % cur_lambda_single,
+                        'lambda_empty=%.6f' % cur_lambda_empty,
+                        'lambda_dec=%.6f' % cur_lambda_dec,
+                    ]
+                    for key, value in dea_log.items():
+                        try:
+                            msg.append('%s=%.6f' % (key, float(value)))
+                        except (TypeError, ValueError):
+                            pass
+                    print('[DEA DEBUG] ' + ' | '.join(msg))
         
             self.optimizer.zero_grad()
             loss.backward()

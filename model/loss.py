@@ -132,16 +132,11 @@ def build_safe_bg(gt, kernel_size=15):
     return safe_bg
 
 
-def single_scale_anti_sufficiency_loss(z_only_max, z_full, gt, tau=0.3):
+def single_scale_anti_sufficiency_loss(z_only_max, gt, tau=0.5):
     safe_bg = build_safe_bg(gt)
 
     with torch.no_grad():
-        hard_bg_from_full = (torch.sigmoid(z_full) > tau).float()
-        hard_bg_from_only = (torch.sigmoid(z_only_max) > tau).float()
-        hard_bg = safe_bg * torch.clamp(
-            hard_bg_from_full + hard_bg_from_only,
-            max=1.0,
-        )
+        hard_bg = safe_bg * (torch.sigmoid(z_only_max.detach()) > tau).float()
 
     loss_map = F.binary_cross_entropy_with_logits(
         z_only_max,
@@ -150,7 +145,12 @@ def single_scale_anti_sufficiency_loss(z_only_max, z_full, gt, tau=0.3):
     )
 
     loss = (loss_map * hard_bg).sum() / (hard_bg.sum() + 1e-6)
-    return loss
+    log_vars = {
+        "hard_bg_ratio": hard_bg.mean().detach(),
+        "z_only_prob_mean": torch.sigmoid(z_only_max.detach()).mean(),
+        "z_only_prob_max": torch.sigmoid(z_only_max.detach()).max(),
+    }
+    return loss, log_vars
 
 
 def empty_evidence_loss(z_empty):
@@ -160,12 +160,12 @@ def empty_evidence_loss(z_empty):
     )
 
 
-def decidability_loss(d_logit, z_full, gt, tau=0.3):
+def decidability_loss(d_logit, z_full, gt, tau=0.5):
     safe_bg = build_safe_bg(gt)
     pos = gt.float()
 
     with torch.no_grad():
-        hard_bg = safe_bg * (torch.sigmoid(z_full) > tau).float()
+        hard_bg = safe_bg * (torch.sigmoid(z_full.detach()) > tau).float()
 
     valid = torch.clamp(pos + hard_bg, max=1.0)
     label = pos
@@ -177,40 +177,61 @@ def decidability_loss(d_logit, z_full, gt, tau=0.3):
     )
 
     loss = (loss_map * valid).sum() / (valid.sum() + 1e-6)
-    return loss
-
-
-def dea_lite_loss(dea_out, z_full, gt,
-                  lambda_single=0.10,
-                  lambda_dec=0.05,
-                  lambda_empty=0.01,
-                  tau=0.3):
-    loss_single = single_scale_anti_sufficiency_loss(
-        dea_out["z_only_max"],
-        z_full,
-        gt,
-        tau=tau,
-    )
-
-    loss_dec = decidability_loss(
-        dea_out["decidability_logit"],
-        z_full,
-        gt,
-        tau=tau,
-    )
-
-    loss_empty = empty_evidence_loss(dea_out["z_empty"])
-
-    loss = (
-        lambda_single * loss_single
-        + lambda_dec * loss_dec
-        + lambda_empty * loss_empty
-    )
-
     log_vars = {
-        "loss_single": loss_single.detach(),
-        "loss_dec": loss_dec.detach(),
-        "loss_empty": loss_empty.detach(),
+        "d_pos_ratio": pos.mean().detach(),
+        "d_hard_bg_ratio": hard_bg.mean().detach(),
+        "d_prob_mean": torch.sigmoid(d_logit.detach()).mean(),
+        "d_prob_max": torch.sigmoid(d_logit.detach()).max(),
     }
-
     return loss, log_vars
+
+
+def dea_lite_loss(
+    dea_out,
+    z_full,
+    gt,
+    lambda_single=0.0,
+    lambda_dec=0.0,
+    lambda_empty=0.0,
+    tau=0.5,
+):
+    total_loss = torch.tensor(0.0, device=z_full.device)
+    log_vars = {}
+
+    if lambda_single > 0:
+        loss_single, single_log = single_scale_anti_sufficiency_loss(
+            dea_out["z_only_max"],
+            gt,
+            tau=tau,
+        )
+        total_loss = total_loss + lambda_single * loss_single
+        log_vars["loss_single_raw"] = loss_single.detach()
+        log_vars["loss_single_weighted"] = (lambda_single * loss_single).detach()
+        log_vars.update(single_log)
+
+    if lambda_empty > 0:
+        loss_empty = empty_evidence_loss(dea_out["z_empty"])
+        total_loss = total_loss + lambda_empty * loss_empty
+        log_vars["loss_empty_raw"] = loss_empty.detach()
+        log_vars["loss_empty_weighted"] = (lambda_empty * loss_empty).detach()
+
+    if lambda_dec > 0:
+        loss_dec, dec_log = decidability_loss(
+            dea_out["decidability_logit"],
+            z_full,
+            gt,
+            tau=tau,
+        )
+        total_loss = total_loss + lambda_dec * loss_dec
+        log_vars["loss_dec_raw"] = loss_dec.detach()
+        log_vars["loss_dec_weighted"] = (lambda_dec * loss_dec).detach()
+        log_vars.update(dec_log)
+    elif "decidability_logit" in dea_out:
+        log_vars["d_prob_mean"] = torch.sigmoid(
+            dea_out["decidability_logit"].detach()
+        ).mean()
+        log_vars["d_prob_max"] = torch.sigmoid(
+            dea_out["decidability_logit"].detach()
+        ).max()
+
+    return total_loss, log_vars
