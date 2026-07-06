@@ -11,6 +11,8 @@ import os.path as osp
 import os
 import time
 import glob
+import random
+import numpy as np
 
 PROJECT_DIR = osp.dirname(osp.abspath(__file__))
 DEFAULT_DATASET_DIR = osp.join(PROJECT_DIR, 'datasets', 'IRSTD-1K')
@@ -38,6 +40,25 @@ def get_dea_ramp(epoch, warm_epoch, ramp_epochs):
     if epoch <= warm_epoch:
         return 0.0
     return min(1.0, float(epoch - warm_epoch) / float(ramp_epochs))
+
+def seed_everything(seed, deterministic=False):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    os.environ["PYTHONHASHSEED"] = str(seed)
+
+    if deterministic:
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+    else:
+        torch.backends.cudnn.deterministic = False
+        torch.backends.cudnn.benchmark = True
+
+def seed_worker(worker_id):
+    worker_seed = torch.initial_seed() % 2**32
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
 
 def parse_args():
 
@@ -73,6 +94,12 @@ def parse_args():
     parser.add_argument('--dea-debug-interval', type=int, default=50)
     parser.add_argument('--dea-debug-max-batches', type=int, default=1)
     parser.add_argument('--dea-detach-evidence', action='store_true')
+    parser.add_argument('--seed', type=int, default=20260706)
+    parser.add_argument('--deterministic', type=str2bool, nargs='?', const=True, default=False)
+    parser.add_argument('--pd-fa-min-pd', type=float, default=0.93)
+    parser.add_argument('--pd-fa-min-iou', type=float, default=0.655)
+    parser.add_argument('--paired-baseline-iou', type=float, default=0.0)
+    parser.add_argument('--pd-fa-iou-margin', type=float, default=0.005)
 
     args = parser.parse_args()
     return args
@@ -88,10 +115,15 @@ class Trainer(object):
         trainset = IRSTD_Dataset(args, mode='train')
         valset = IRSTD_Dataset(args, mode='val')
 
+        data_generator = torch.Generator()
+        data_generator.manual_seed(args.seed)
+
         loader_kwargs = {
             "num_workers": args.num_workers,
             "pin_memory": args.pin_memory,
             "persistent_workers": args.num_workers > 0,
+            "worker_init_fn": seed_worker,
+            "generator": data_generator,
         }
         if args.num_workers > 0:
             loader_kwargs["prefetch_factor"] = 2
@@ -112,7 +144,7 @@ class Trainer(object):
 
         device = torch.device('cuda')
         self.device = device
-        torch.backends.cudnn.benchmark = False
+        torch.backends.cudnn.benchmark = not args.deterministic
 
         model = MSHNet(3)
 
@@ -130,7 +162,11 @@ class Trainer(object):
         self.PD_FA = PD_FA(1, 10, args.base_size)
         self.mIoU = mIoU(1)
         self.ROC  = ROCMetric(1, 10)
-        self.best_iou = 0
+        self.best_iou = 0.0
+        self.best_pd_fa = float('inf')
+        self.best_pd_fa_iou = 0.0
+        self.best_pd_fa_pd = 0.0
+        self.best_pd_fa_epoch = -1
         self.warm_epoch = args.warm_epoch
 
         if args.mode=='train':
@@ -146,8 +182,12 @@ class Trainer(object):
                     except (ValueError, RuntimeError) as exc:
                         print('skip optimizer state: %s' % exc)
                 self.set_optimizer_lr(args.lr)
-                self.start_epoch = checkpoint['epoch']+1
-                self.best_iou = checkpoint['iou']
+                self.start_epoch = checkpoint.get('epoch', -1) + 1
+                self.best_iou = float(checkpoint.get('best_iou', checkpoint.get('iou', 0.0)))
+                self.best_pd_fa = float(checkpoint.get('best_pd_fa', float('inf')))
+                self.best_pd_fa_iou = float(checkpoint.get('best_pd_fa_iou', 0.0))
+                self.best_pd_fa_pd = float(checkpoint.get('best_pd_fa_pd', 0.0))
+                self.best_pd_fa_epoch = int(checkpoint.get('best_pd_fa_epoch', -1))
                 self.save_folder = check_folder
             else:
                 self.save_folder = osp.join(
@@ -158,7 +198,8 @@ class Trainer(object):
         if args.mode=='test':
           
             weight = load_torch_file(args.weight_path)
-            self.load_model_state(weight['state_dict'])
+            state_dict = self.extract_state_dict(weight)
+            self.load_model_state(state_dict)
             '''
                 # iou_67.87_weight
                 weight = torch.load(args.weight_path)
@@ -174,6 +215,24 @@ class Trainer(object):
         if not device_ids:
             raise ValueError('No GPU ids selected.')
         return device_ids
+
+    def extract_state_dict(self, weight_obj):
+        if isinstance(weight_obj, dict):
+            if 'state_dict' in weight_obj:
+                return weight_obj['state_dict']
+            if 'net' in weight_obj:
+                return weight_obj['net']
+
+            looks_like_state_dict = all(
+                torch.is_tensor(value) for value in weight_obj.values()
+            )
+            if looks_like_state_dict:
+                return weight_obj
+
+        raise RuntimeError(
+            'Unsupported weight format. Expected raw state_dict, '
+            'dict with state_dict, or dict with net.'
+        )
 
     def load_model_state(self, state_dict):
         try:
@@ -362,6 +421,19 @@ class Trainer(object):
             if self.mode == 'train':
                 current_pd = PD[0]
                 current_fa = FA[0] * 1000000
+                if self.args.paired_baseline_iou > 0:
+                    pd_fa_iou_threshold = max(
+                        self.args.pd_fa_min_iou,
+                        self.args.paired_baseline_iou - self.args.pd_fa_iou_margin,
+                    )
+                else:
+                    pd_fa_iou_threshold = self.args.pd_fa_min_iou
+
+                is_pd_fa_candidate = (
+                    current_pd >= self.args.pd_fa_min_pd
+                    and mean_IoU >= pd_fa_iou_threshold
+                    and current_fa < self.best_pd_fa
+                )
                 metric_line = '{} - {:04d}\t - IoU {:.4f}\t - PD {:.4f}\t - FA {:.4f}\n'.format(
                     time.strftime('%Y-%m-%d-%H-%M-%S',time.localtime(time.time())),
                     epoch,
@@ -376,14 +448,82 @@ class Trainer(object):
                 if mean_IoU > self.best_iou:
                     self.best_iou = mean_IoU
                 
-                    torch.save(self.model.state_dict(), osp.join(self.save_folder, 'weight.pkl'))
+                    torch.save(
+                        self.model.state_dict(),
+                        osp.join(self.save_folder, 'weight.pkl'),
+                    )
+
+                    best_iou_states = {
+                        "net": self.model.state_dict(),
+                        "optimizer": self.optimizer.state_dict(),
+                        "epoch": epoch,
+                        "iou": mean_IoU,
+                        "pd": current_pd,
+                        "fa": current_fa,
+                        "best_iou": self.best_iou,
+                        "best_pd_fa": self.best_pd_fa,
+                        "best_pd_fa_iou": self.best_pd_fa_iou,
+                        "best_pd_fa_pd": self.best_pd_fa_pd,
+                        "best_pd_fa_epoch": self.best_pd_fa_epoch,
+                    }
+                    torch.save(
+                        best_iou_states,
+                        osp.join(self.save_folder, 'checkpoint_best_iou.pkl'),
+                    )
+
                     with open(osp.join(self.save_folder, 'metric.log'), 'a') as f:
                         f.write('{} - {:04d}\t - IoU {:.4f}\t - PD {:.4f}\t - FA {:.4f}\n' .
                             format(time.strftime('%Y-%m-%d-%H-%M-%S',time.localtime(time.time())), 
                                 epoch, self.best_iou, current_pd, current_fa))
+
+                if is_pd_fa_candidate:
+                    self.best_pd_fa = current_fa
+                    self.best_pd_fa_iou = mean_IoU
+                    self.best_pd_fa_pd = current_pd
+                    self.best_pd_fa_epoch = epoch
+
+                    torch.save(
+                        self.model.state_dict(),
+                        osp.join(self.save_folder, 'weight_pd_fa_best.pkl'),
+                    )
+
+                    pd_fa_states = {
+                        "net": self.model.state_dict(),
+                        "optimizer": self.optimizer.state_dict(),
+                        "epoch": epoch,
+                        "iou": mean_IoU,
+                        "pd": current_pd,
+                        "fa": current_fa,
+                        "best_iou": self.best_iou,
+                        "best_pd_fa": self.best_pd_fa,
+                        "best_pd_fa_iou": self.best_pd_fa_iou,
+                        "best_pd_fa_pd": self.best_pd_fa_pd,
+                        "best_pd_fa_epoch": self.best_pd_fa_epoch,
+                    }
+                    torch.save(
+                        pd_fa_states,
+                        osp.join(self.save_folder, 'checkpoint_pd_fa_best.pkl'),
+                    )
+
+                    with open(osp.join(self.save_folder, 'metric_pd_fa_best.log'), 'a') as f:
+                        f.write('{} - {:04d}\t - IoU {:.4f}\t - PD {:.4f}\t - FA {:.4f}\n' .
+                            format(time.strftime('%Y-%m-%d-%H-%M-%S',time.localtime(time.time())), 
+                                epoch, mean_IoU, current_pd, current_fa))
                         
-                all_states = {"net":self.model.state_dict(), "optimizer":self.optimizer.state_dict(), "epoch": epoch, "iou":self.best_iou}
-                torch.save(all_states, osp.join(self.save_folder, 'checkpoint.pkl'))
+                latest_states = {
+                    "net": self.model.state_dict(),
+                    "optimizer": self.optimizer.state_dict(),
+                    "epoch": epoch,
+                    "iou": mean_IoU,
+                    "pd": current_pd,
+                    "fa": current_fa,
+                    "best_iou": self.best_iou,
+                    "best_pd_fa": self.best_pd_fa,
+                    "best_pd_fa_iou": self.best_pd_fa_iou,
+                    "best_pd_fa_pd": self.best_pd_fa_pd,
+                    "best_pd_fa_epoch": self.best_pd_fa_epoch,
+                }
+                torch.save(latest_states, osp.join(self.save_folder, 'checkpoint.pkl'))
             elif self.mode == 'test':
                 print('mIoU: '+str(mean_IoU)+'\n')
                 print('Pd: '+str(PD[0])+'\n')
@@ -393,6 +533,7 @@ class Trainer(object):
          
 if __name__ == '__main__':
     args = parse_args()
+    seed_everything(args.seed, args.deterministic)
 
     trainer = Trainer(args)
     
