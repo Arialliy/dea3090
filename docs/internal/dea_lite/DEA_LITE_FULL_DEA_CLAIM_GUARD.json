@@ -1,0 +1,12 @@
+{
+  "decision": "PASS_NO_FULL_DEA_CLAIM_FROM_DEA_LITE",
+  "guard": "check_no_full_dea_claim_from_dea_lite",
+  "pass": true,
+  "root": "/home/ly/DEA",
+  "scanned_files": [
+    "README.md",
+    "docs/internal/dea_lite/DEA_LITE_METHOD_FREEZE_AFTER_NUAA.md",
+    "docs/internal/dea_lite_0p005/evidence_status_after_nuaa.md"
+  ],
+  "violations": []
+}

@@ -1,0 +1,29 @@
+{
+  "decision": "DEA_LITE_FROZEN_AS_PILOT_ABLATION_LIMITATION_EVIDENCE",
+  "root": "/home/ly/DEA",
+  "branch": "dea-lite-0p005-nuaa-negative-archive",
+  "commit": "6c537e905007d596c39c51e235ee638f1f25d87e",
+  "git_dirty_entry_count_after_freeze_files": 7,
+  "method_status": "DEA-lite is not full DEA",
+  "evidence_status": {
+    "NUDT-SIRST": "positive_anchor",
+    "IRSTD-1K": "fa_control_positive_signal",
+    "NUAA-SIRST": "stable_negative_dataset_dependent_failure"
+  },
+  "nuaa_negative": {
+    "gate_pass": false,
+    "decision": "DEA_LITE_NEGATIVE_DATASET_DEPENDENT",
+    "delta_iou": -0.0336,
+    "delta_pd": -0.0266,
+    "delta_fa": 2.2104,
+    "num_gate_pass_epochs": 0
+  },
+  "allowed_next_step": "open full-dea-predeclare-design branch and add protocol document only",
+  "forbidden_next_steps": [
+    "claim DEA-lite validates full DEA",
+    "claim universal DEA-lite improvement",
+    "run lambda 0.01 as DEA-main rescue",
+    "mix Full DEA implementation code into the DEA-lite freeze branch"
+  ],
+  "claim_guard_json": "docs/internal/dea_lite/DEA_LITE_FULL_DEA_CLAIM_GUARD.json"
+}
