@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 from pathlib import Path
 from typing import Any
 
@@ -49,7 +50,10 @@ def main() -> None:
 
     def f(key: str) -> float | None:
         value = data.get(key)
-        return None if value is None else float(value)
+        if value is None:
+            return None
+        value = float(value)
+        return value if math.isfinite(value) else None
 
     epoch = data.get("epoch")
     if epoch is None:
@@ -83,7 +87,10 @@ def main() -> None:
 
     out = Path(args.output).expanduser().resolve()
     out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(json.dumps(result, indent=2, sort_keys=True), encoding="utf-8")
+    out.write_text(
+        json.dumps(result, allow_nan=False, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
 
 
 if __name__ == "__main__":

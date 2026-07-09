@@ -2,9 +2,12 @@ from utils.data import *
 from utils.metric import *
 from argparse import ArgumentParser, ArgumentTypeError
 import torch
+import torch.nn as nn
 import torch.utils.data as Data
 from model.MSHNet import *
 from model.loss import *
+from model.full_dea_mshnet import FullDEAMSHNet
+from model.full_dea_loss import full_dea_aux_loss_v2
 from torch.optim import Adagrad
 from tqdm import tqdm
 import os.path as osp
@@ -60,6 +63,77 @@ def seed_worker(worker_id):
     np.random.seed(worker_seed)
     random.seed(worker_seed)
 
+def validate_args(args):
+    if args.model_type == "full_dea":
+        if args.if_checkpoint and args.init_from_baseline:
+            raise ValueError("--if-checkpoint and --init-from-baseline are separate paths.")
+        if not args.init_from_baseline and not args.if_checkpoint:
+            print("warning: Full DEA is running without --init-from-baseline.")
+        lite_lambdas = (
+            args.dea_lambda_single,
+            args.dea_lambda_dec,
+            args.dea_lambda_empty,
+        )
+        if any(float(value) != 0.0 for value in lite_lambdas):
+            raise ValueError(
+                "Full DEA and DEA-lite losses must not be enabled together."
+            )
+        if args.full_dea_safe_kernel <= 0 or args.full_dea_safe_kernel % 2 == 0:
+            raise ValueError("--full-dea-safe-kernel must be a positive odd integer.")
+        for name in (
+            "full_dea_topk_ratio",
+            "full_dea_max_hard_bg_ratio",
+        ):
+            value = float(getattr(args, name))
+            if value < 0.0 or value > 1.0:
+                raise ValueError("--%s must be in [0, 1]." % name.replace("_", "-"))
+        if float(args.full_dea_topk_min_score) < 0.0:
+            raise ValueError("--full-dea-topk-min-score must be non-negative.")
+        if args.init_from_baseline and not osp.isfile(args.init_from_baseline):
+            raise FileNotFoundError(args.init_from_baseline)
+    return args
+
+def get_method_name(args):
+    if args.model_type == "full_dea":
+        return "FullDEA-v2"
+    if (
+        args.dea_lambda_single > 0
+        or args.dea_lambda_dec > 0
+        or args.dea_lambda_empty > 0
+    ):
+        return "DEA-lite"
+    return "MSHNet"
+
+def get_run_folder_name(args, timestamp=None):
+    if timestamp is None:
+        timestamp = time.strftime('%Y-%m-%d-%H-%M-%S', time.localtime(time.time()))
+    safe_method = get_method_name(args).replace('/', '_')
+    return '%s-%s' % (safe_method, timestamp)
+
+def get_method_metadata(args):
+    return {
+        "method": get_method_name(args),
+        "model_type": args.model_type,
+        "init_from_baseline": args.init_from_baseline,
+        "full_dea_lambda": float(args.full_dea_lambda),
+        "full_dea_ramp_epochs": int(args.full_dea_ramp_epochs),
+        "full_dea_start_epoch": int(args.full_dea_start_epoch),
+        "full_dea_freeze_backbone_epochs": int(args.full_dea_freeze_backbone_epochs),
+        "full_dea_tau_base": float(args.full_dea_tau_base),
+        "full_dea_tau_target": float(args.full_dea_tau_target),
+        "full_dea_tau_scale": float(args.full_dea_tau_scale),
+        "full_dea_topk_ratio": float(args.full_dea_topk_ratio),
+        "full_dea_topk_min_score": float(args.full_dea_topk_min_score),
+        "full_dea_max_hard_bg_ratio": float(args.full_dea_max_hard_bg_ratio),
+        "full_dea_safe_kernel": int(args.full_dea_safe_kernel),
+        "dea_lambda_single": float(args.dea_lambda_single),
+        "dea_lambda_dec": float(args.dea_lambda_dec),
+        "dea_lambda_empty": float(args.dea_lambda_empty),
+        "dataset_dir": args.dataset_dir,
+        "seed": int(args.seed),
+        "deterministic": bool(args.deterministic),
+    }
+
 def parse_args():
 
     #
@@ -85,6 +159,13 @@ def parse_args():
     parser.add_argument('--mode', type=str, default='train')
     parser.add_argument('--weight-path', type=str, default=osp.join(DEFAULT_WEIGHT_DIR, 'IRSTD-1k_weight.tar'))
     parser.add_argument('--checkpoint-dir', type=str, default='')
+    parser.add_argument(
+        '--model-type',
+        type=str,
+        default='mshnet',
+        choices=['mshnet', 'full_dea'],
+    )
+    parser.add_argument('--init-from-baseline', type=str, default='')
     parser.add_argument('--dea-lambda-single', type=float, default=0.0)
     parser.add_argument('--dea-lambda-dec', type=float, default=0.0)
     parser.add_argument('--dea-lambda-empty', type=float, default=0.0)
@@ -100,9 +181,21 @@ def parse_args():
     parser.add_argument('--pd-fa-min-iou', type=float, default=0.655)
     parser.add_argument('--paired-baseline-iou', type=float, default=0.0)
     parser.add_argument('--pd-fa-iou-margin', type=float, default=0.005)
+    parser.add_argument('--full-dea-lambda', type=float, default=1.0)
+    parser.add_argument('--full-dea-ramp-epochs', type=int, default=30)
+    parser.add_argument('--full-dea-start-epoch', type=int, default=0)
+    parser.add_argument('--full-dea-freeze-backbone-epochs', type=int, default=0)
+    parser.add_argument('--full-dea-tau-base', type=float, default=0.45)
+    parser.add_argument('--full-dea-tau-target', type=float, default=0.45)
+    parser.add_argument('--full-dea-tau-scale', type=float, default=0.45)
+    parser.add_argument('--full-dea-topk-ratio', type=float, default=0.001)
+    parser.add_argument('--full-dea-topk-min-score', type=float, default=0.45)
+    parser.add_argument('--full-dea-max-hard-bg-ratio', type=float, default=0.003)
+    parser.add_argument('--full-dea-safe-kernel', type=int, default=15)
+    parser.add_argument('--full-dea-debug', action='store_true')
 
     args = parser.parse_args()
-    return args
+    return validate_args(args)
 
 class Trainer(object):
     def __init__(self, args):
@@ -146,7 +239,10 @@ class Trainer(object):
         self.device = device
         torch.backends.cudnn.benchmark = not args.deterministic
 
-        model = MSHNet(3)
+        if args.model_type == "full_dea":
+            model = FullDEAMSHNet(3)
+        else:
+            model = MSHNet(3)
 
         if args.multi_gpus and torch.cuda.device_count() > 1:
             device_ids = self.parse_gpu_ids(args.gpu_ids)
@@ -154,6 +250,14 @@ class Trainer(object):
             model = nn.DataParallel(model, device_ids=device_ids)
         model.to(device)
         self.model = model
+
+        if args.mode == 'train' and args.init_from_baseline and not args.if_checkpoint:
+            baseline = load_torch_file(args.init_from_baseline)
+            state_dict = self.extract_state_dict(baseline)
+            self.load_model_state_partial(
+                state_dict,
+                allowed_missing_prefixes=("full_dea_head.",),
+            )
 
         self.optimizer = Adagrad(filter(lambda p: p.requires_grad, self.model.parameters()), lr=args.lr)
 
@@ -192,7 +296,7 @@ class Trainer(object):
             else:
                 self.save_folder = osp.join(
                     DEFAULT_WEIGHT_DIR,
-                    'MSHNet-%s' % (time.strftime('%Y-%m-%d-%H-%M-%S',time.localtime(time.time()))),
+                    get_run_folder_name(args),
                 )
                 os.makedirs(self.save_folder, exist_ok=True)
         if args.mode=='test':
@@ -257,24 +361,49 @@ class Trainer(object):
 
         raise RuntimeError('Failed to load model state_dict.')
 
+    def load_model_state_partial(self, state_dict, allowed_missing_prefixes=()):
+        target_model = self.model.module if isinstance(self.model, nn.DataParallel) else self.model
+        if state_dict and all(key.startswith('module.') for key in state_dict.keys()):
+            state_dict = {key[len('module.'):]: value for key, value in state_dict.items()}
+
+        missing, unexpected = target_model.load_state_dict(state_dict, strict=False)
+        bad_missing = [
+            key
+            for key in missing
+            if not any(key.startswith(prefix) for prefix in allowed_missing_prefixes)
+        ]
+        if bad_missing or unexpected:
+            raise RuntimeError(
+                'Partial baseline load failed. bad_missing=%s unexpected=%s'
+                % (bad_missing, unexpected)
+            )
+        print(
+            'loaded baseline with partial state: missing=%d unexpected=%d'
+            % (len(missing), len(unexpected))
+        )
+
     def set_optimizer_lr(self, lr):
         for param_group in self.optimizer.param_groups:
             param_group['lr'] = lr
         print('set optimizer lr: %.6f' % lr)
 
     def find_latest_checkpoint_folder(self):
+        run_glob = '%s-*' % get_method_name(self.args)
         checkpoint_paths = sorted(
-            glob.glob(osp.join(DEFAULT_WEIGHT_DIR, 'MSHNet-*', 'checkpoint.pkl')),
+            glob.glob(osp.join(DEFAULT_WEIGHT_DIR, run_glob, 'checkpoint.pkl')),
             key=osp.getmtime,
         )
         if not checkpoint_paths:
             raise FileNotFoundError(
-                'No checkpoint found under %s. Pass --checkpoint-dir inside the project weight directory.' % DEFAULT_WEIGHT_DIR
+                'No %s checkpoint found under %s. Pass --checkpoint-dir inside the project weight directory.'
+                % (get_method_name(self.args), DEFAULT_WEIGHT_DIR)
             )
         return osp.dirname(checkpoint_paths[-1])
         
     def use_dea(self, epoch):
         return (
+            self.args.model_type != "full_dea"
+            and
             epoch > self.warm_epoch
             and (
                 self.args.dea_lambda_single > 0
@@ -282,6 +411,42 @@ class Trainer(object):
                 or self.args.dea_lambda_empty > 0
             )
         )
+
+    def get_forward_tag(self, epoch):
+        if self.args.model_type == "full_dea":
+            return epoch >= self.args.full_dea_start_epoch
+        return epoch > self.warm_epoch
+
+    def get_full_dea_ramp(self, epoch):
+        if epoch < self.args.full_dea_start_epoch:
+            return 0.0
+        return get_dea_ramp(
+            epoch,
+            self.args.full_dea_start_epoch - 1,
+            self.args.full_dea_ramp_epochs,
+        )
+
+    def configure_full_dea_trainable(self, epoch):
+        if self.args.model_type != "full_dea":
+            return
+
+        freeze = epoch < self.args.full_dea_freeze_backbone_epochs
+        model = self.model.module if isinstance(self.model, nn.DataParallel) else self.model
+        for name, param in model.named_parameters():
+            if freeze:
+                param.requires_grad = name.startswith("full_dea_head")
+            else:
+                param.requires_grad = True
+
+    def format_log_dict(self, log_dict):
+        msg = []
+        for key, value in log_dict.items():
+            try:
+                scalar = float(value.detach().mean()) if torch.is_tensor(value) else float(value)
+                msg.append('%s=%.6f' % (key, scalar))
+            except (TypeError, ValueError):
+                pass
+        return msg
 
     def save_dea_debug(self, epoch, iteration, data, labels, pred, dea_out):
         if not self.args.save_dea_debug:
@@ -314,6 +479,7 @@ class Trainer(object):
         torch.save(sample, osp.join(debug_dir, 'epoch_%04d_iter_%04d.pt' % (epoch, iteration)))
 
     def train(self, epoch):
+        self.configure_full_dea_trainable(epoch)
         self.model.train()
         tbar = tqdm(self.train_loader)
         losses = AverageMeter()
@@ -322,10 +488,17 @@ class Trainer(object):
             data = data.to(self.device, non_blocking=True)
             labels = mask.to(self.device, non_blocking=True)
 
-            tag = epoch > self.warm_epoch
+            tag = self.get_forward_tag(epoch)
             use_dea = self.use_dea(epoch)
 
-            if use_dea:
+            full_dea_out = None
+            if self.args.model_type == "full_dea":
+                out = self.model(data, tag, return_dict=True)
+                masks = out["masks"]
+                pred = out["pred"]
+                full_dea_out = out["full_dea"]
+                dea_out = None
+            elif use_dea:
                 masks, pred, dea_out = self.model(
                     data,
                     tag,
@@ -348,7 +521,34 @@ class Trainer(object):
             loss = loss / (len(masks)+1)
             loss_seg_for_debug = loss.detach()
 
-            if use_dea:
+            if self.args.model_type == "full_dea" and full_dea_out is not None:
+                ramp = self.get_full_dea_ramp(epoch)
+                loss_full_dea, full_dea_log = full_dea_aux_loss_v2(
+                    full_dea_out=full_dea_out,
+                    target=labels,
+                    epoch=epoch,
+                    warm_epoch=self.warm_epoch,
+                    seg_criterion=self.loss_fun,
+                    tau_base=self.args.full_dea_tau_base,
+                    tau_target=self.args.full_dea_tau_target,
+                    tau_scale=self.args.full_dea_tau_scale,
+                    safe_kernel=self.args.full_dea_safe_kernel,
+                    topk_ratio=self.args.full_dea_topk_ratio,
+                    topk_min_score=self.args.full_dea_topk_min_score,
+                    max_hard_bg_ratio=self.args.full_dea_max_hard_bg_ratio,
+                )
+                loss = loss + self.args.full_dea_lambda * ramp * loss_full_dea
+
+                if self.args.full_dea_debug and i % max(1, self.args.dea_debug_interval) == 0:
+                    msg = [
+                        'full_dea_ramp=%.6f' % ramp,
+                        'full_dea_loss=%.6f' % float(loss_full_dea.detach()),
+                        'full_dea_weighted=%.6f'
+                        % float((self.args.full_dea_lambda * ramp * loss_full_dea).detach()),
+                    ]
+                    msg.extend(self.format_log_dict(full_dea_log))
+                    print('[FULL DEA DEBUG] ' + ' | '.join(msg))
+            elif use_dea:
                 ramp = get_dea_ramp(epoch, self.warm_epoch, self.args.dea_ramp_epochs)
                 cur_lambda_single = self.args.dea_lambda_single * ramp
                 cur_lambda_dec = self.args.dea_lambda_dec * ramp
@@ -374,11 +574,7 @@ class Trainer(object):
                         'lambda_empty=%.6f' % cur_lambda_empty,
                         'lambda_dec=%.6f' % cur_lambda_dec,
                     ]
-                    for key, value in dea_log.items():
-                        try:
-                            msg.append('%s=%.6f' % (key, float(value)))
-                        except (TypeError, ValueError):
-                            pass
+                    msg.extend(self.format_log_dict(dea_log))
                     print('[DEA DEBUG] ' + ' | '.join(msg))
         
             self.optimizer.zero_grad()
@@ -400,11 +596,17 @@ class Trainer(object):
                 data = data.to(self.device, non_blocking=True)
                 mask = mask.to(self.device, non_blocking=True)
 
-                if epoch>self.warm_epoch:
+                if self.args.model_type == "full_dea":
+                    tag = True
+                elif epoch>self.warm_epoch:
                     tag = True
 
                 loss = 0
-                _, pred = self.model(data, tag)
+                if self.args.model_type == "full_dea":
+                    out = self.model(data, tag, return_dict=True)
+                    pred = out["pred"]
+                else:
+                    _, pred = self.model(data, tag)
                 # loss += self.loss_fun(pred, mask,self.warm_epoch, epoch)
 
                 self.mIoU.update(pred, mask)
@@ -465,6 +667,7 @@ class Trainer(object):
                         "best_pd_fa_iou": self.best_pd_fa_iou,
                         "best_pd_fa_pd": self.best_pd_fa_pd,
                         "best_pd_fa_epoch": self.best_pd_fa_epoch,
+                        "method_meta": get_method_metadata(self.args),
                     }
                     torch.save(
                         best_iou_states,
@@ -499,6 +702,7 @@ class Trainer(object):
                         "best_pd_fa_iou": self.best_pd_fa_iou,
                         "best_pd_fa_pd": self.best_pd_fa_pd,
                         "best_pd_fa_epoch": self.best_pd_fa_epoch,
+                        "method_meta": get_method_metadata(self.args),
                     }
                     torch.save(
                         pd_fa_states,
@@ -522,6 +726,7 @@ class Trainer(object):
                     "best_pd_fa_iou": self.best_pd_fa_iou,
                     "best_pd_fa_pd": self.best_pd_fa_pd,
                     "best_pd_fa_epoch": self.best_pd_fa_epoch,
+                    "method_meta": get_method_metadata(self.args),
                 }
                 torch.save(latest_states, osp.join(self.save_folder, 'checkpoint.pkl'))
             elif self.mode == 'test':
