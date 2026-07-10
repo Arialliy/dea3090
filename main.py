@@ -10,6 +10,11 @@ from model.loss import *
 from model.full_dea_mshnet import FullDEAMSHNet
 from model.dea_integrated_mshnet import DEAIntegratedMSHNet
 from model.dea_mshnet import DEAMSHNet
+from model.dea_counterfactual_veto import (
+    CounterfactualVetoMSHNet,
+    FineScaleVetoMSHNet,
+    SharedCEVMSHNet,
+)
 from model.dea_integrated_loss import residual_aligned_route_loss
 from model.full_dea_loss import (
     full_dea_aux_loss_v2,
@@ -30,10 +35,14 @@ PROJECT_DIR = osp.dirname(osp.abspath(__file__))
 DEFAULT_DATASET_DIR = osp.join(PROJECT_DIR, 'datasets', 'IRSTD-1K')
 DEFAULT_WEIGHT_DIR = osp.join(PROJECT_DIR, 'weight')
 DEA_MODEL_TYPES = ('dea', 'predictive_correction')
+CEV_CONTROL_TYPES = ('dea_fine_veto_control', 'dea_cev_control')
 
 
 def is_dea_main_model(model_type):
     return model_type in DEA_MODEL_TYPES
+
+def is_cev_control(model_type):
+    return model_type in CEV_CONTROL_TYPES
 
 def str2bool(value):
     if isinstance(value, bool):
@@ -172,6 +181,38 @@ def validate_args(args):
         if args.init_from_baseline and not osp.isfile(args.init_from_baseline):
             raise FileNotFoundError(args.init_from_baseline)
 
+    if is_cev_control(args.model_type):
+        if args.if_checkpoint and args.init_from_baseline:
+            raise ValueError(
+                "--if-checkpoint and --init-from-baseline are separate paths."
+            )
+        if (
+            getattr(args, "mode", "train") == "train"
+            and not args.if_checkpoint
+            and not args.init_from_baseline
+        ):
+            raise ValueError(
+                "CEV controls must start from a complete trained MSHNet; "
+                "pass --init-from-baseline."
+            )
+        kernel_size = int(getattr(args, "cev_kernel_size", 7))
+        if kernel_size <= 0 or kernel_size % 2 == 0:
+            raise ValueError("--cev-kernel-size must be a positive odd integer.")
+        veto_strength = float(getattr(args, "cev_veto_strength", 1.0))
+        if not 0.0 <= veto_strength <= 1.0:
+            raise ValueError("--cev-veto-strength must be in [0,1].")
+        lite_lambdas = (
+            args.dea_lambda_single,
+            args.dea_lambda_dec,
+            args.dea_lambda_empty,
+        )
+        if any(float(value) != 0.0 for value in lite_lambdas):
+            raise ValueError(
+                "CEV controls and DEA-lite losses must not be enabled together."
+            )
+        if args.init_from_baseline and not osp.isfile(args.init_from_baseline):
+            raise FileNotFoundError(args.init_from_baseline)
+
     if is_dea_main_model(args.model_type):
         if int(args.predictive_state_channels) < 4:
             raise ValueError("--predictive-state-channels must be >= 4.")
@@ -205,6 +246,11 @@ def validate_args(args):
     return args
 
 def get_method_name(args):
+    if is_cev_control(args.model_type):
+        kernel = int(getattr(args, "cev_kernel_size", 7))
+        if args.model_type == "dea_fine_veto_control":
+            return "FineScaleVeto-Control-K%d" % kernel
+        return "SharedCEV-Control-K%d" % kernel
     if is_dea_main_model(args.model_type):
         eta = ("%g" % float(
             getattr(args, "predictive_step_size", 1.0)
@@ -266,6 +312,10 @@ def get_method_metadata(args):
     return {
         "method": get_method_name(args),
         "model_type": args.model_type,
+        "cev_kernel_size": int(getattr(args, "cev_kernel_size", 7)),
+        "cev_initial_bias": float(getattr(args, "cev_initial_bias", -6.0)),
+        "cev_veto_strength": float(getattr(args, "cev_veto_strength", 1.0)),
+        "cev_baseline_frozen": bool(is_cev_control(args.model_type)),
         "full_dea_version": getattr(args, "full_dea_version", ""),
         "init_from_baseline": getattr(
             args, "origin_baseline_checkpoint", args.init_from_baseline
@@ -378,9 +428,20 @@ def parse_args():
         '--model-type',
         type=str,
         default='mshnet',
-        choices=['mshnet', 'dea', 'full_dea', 'dea_integrated', 'predictive_correction'],
+        choices=[
+            'mshnet',
+            'dea',
+            'full_dea',
+            'dea_integrated',
+            'predictive_correction',
+            'dea_fine_veto_control',
+            'dea_cev_control',
+        ],
     )
     parser.add_argument('--init-from-baseline', type=str, default='')
+    parser.add_argument('--cev-kernel-size', type=int, default=7)
+    parser.add_argument('--cev-initial-bias', type=float, default=-6.0)
+    parser.add_argument('--cev-veto-strength', type=float, default=1.0)
     parser.add_argument('--dea-lambda-single', type=float, default=0.0)
     parser.add_argument('--dea-lambda-dec', type=float, default=0.0)
     parser.add_argument('--dea-lambda-empty', type=float, default=0.0)
@@ -549,7 +610,23 @@ class Trainer(object):
         self.device = device
         torch.backends.cudnn.benchmark = not args.deterministic
 
-        if args.model_type == "full_dea":
+        if args.model_type == "dea_fine_veto_control":
+            model = FineScaleVetoMSHNet(
+                3,
+                kernel_size=args.cev_kernel_size,
+                initial_bias=args.cev_initial_bias,
+                veto_strength=args.cev_veto_strength,
+                freeze_baseline=True,
+            )
+        elif args.model_type == "dea_cev_control":
+            model = SharedCEVMSHNet(
+                3,
+                kernel_size=args.cev_kernel_size,
+                initial_bias=args.cev_initial_bias,
+                veto_strength=args.cev_veto_strength,
+                freeze_baseline=True,
+            )
+        elif args.model_type == "full_dea":
             model = FullDEAMSHNet(3, full_dea_version=args.full_dea_version)
         elif args.model_type == "dea_integrated":
             model = DEAIntegratedMSHNet(
@@ -586,7 +663,12 @@ class Trainer(object):
         if args.mode == 'train' and args.init_from_baseline and not args.if_checkpoint:
             baseline = load_torch_file(args.init_from_baseline)
             state_dict = self.extract_state_dict(baseline)
-            if args.model_type == "dea_integrated":
+            if is_cev_control(args.model_type):
+                allowed_missing = CounterfactualVetoMSHNet.BASELINE_MISSING_PREFIXES
+                allowed_unexpected = (
+                    CounterfactualVetoMSHNet.BASELINE_UNEXPECTED_PREFIXES
+                )
+            elif args.model_type == "dea_integrated":
                 allowed_missing = DEAIntegratedMSHNet.BASELINE_MISSING_PREFIXES
                 allowed_unexpected = DEAIntegratedMSHNet.BASELINE_UNEXPECTED_PREFIXES
             elif is_dea_main_model(args.model_type):
@@ -735,8 +817,10 @@ class Trainer(object):
         checkpoint,
         check_split_hashes,
     ):
-        if self.args.model_type != 'dea_integrated' and not is_dea_main_model(
-            self.args.model_type
+        if (
+            self.args.model_type != 'dea_integrated'
+            and not is_dea_main_model(self.args.model_type)
+            and not is_cev_control(self.args.model_type)
         ):
             return
         if not isinstance(checkpoint, dict) or 'method_meta' not in checkpoint:
@@ -749,7 +833,16 @@ class Trainer(object):
 
         metadata = checkpoint['method_meta']
         expected = get_method_metadata(self.args)
-        if self.args.model_type == 'dea_integrated':
+        if is_cev_control(self.args.model_type):
+            semantic_keys = (
+                'model_type',
+                'cev_kernel_size',
+                'cev_initial_bias',
+                'cev_veto_strength',
+                'cev_baseline_frozen',
+                'test_split_sha256',
+            )
+        elif self.args.model_type == 'dea_integrated':
             semantic_keys = (
                 'model_type',
                 'integrated_route_channels',
@@ -919,6 +1012,10 @@ class Trainer(object):
         )
 
     def get_forward_tag(self, epoch):
+        if is_cev_control(self.args.model_type):
+            # CEV is a frozen-checkpoint control over the complete four-scale
+            # MSHNet graph; there is no cold single-head training phase.
+            return True
         if self.args.model_type == "full_dea":
             return epoch >= self.args.full_dea_start_epoch
         if self.args.model_type == "dea_integrated":
@@ -1242,7 +1339,14 @@ class Trainer(object):
 
             full_dea_out = None
             dea_main_out = None
-            if self.args.model_type == "full_dea":
+            cev_out = None
+            if is_cev_control(self.args.model_type):
+                out = self.model(data, True, return_dict=True)
+                masks = out["masks"]
+                pred = out["pred"]
+                cev_out = out["cev"]
+                dea_out = None
+            elif self.args.model_type == "full_dea":
                 out = self.model(data, tag, return_dict=True)
                 masks = out["masks"]
                 pred = out["pred"]
@@ -1278,7 +1382,12 @@ class Trainer(object):
                 masks, pred = self.model(data, tag)
                 dea_out = None
 
-            if dea_main_out is not None:
+            if cev_out is not None:
+                # Side heads and the whole MSHNet path are frozen.  Averaging
+                # their constant auxiliary losses with the only trainable final
+                # CEV loss would silently divide the veto gradient by five.
+                loss = self.loss_fun(pred, labels, self.warm_epoch, epoch)
+            elif dea_main_out is not None:
                 loss = self.dea_main_loss(
                     dea_main_out["state_logits"], labels, epoch
                 )
@@ -1483,7 +1592,9 @@ class Trainer(object):
                 if self.args.model_type in (
                     "full_dea",
                     "dea_integrated",
-                ) or is_dea_main_model(self.args.model_type):
+                ) or is_dea_main_model(self.args.model_type) or is_cev_control(
+                    self.args.model_type
+                ):
                     out = self.model(data, tag, return_dict=True)
                     pred = out["pred"]
                     if route_audit is not None:
