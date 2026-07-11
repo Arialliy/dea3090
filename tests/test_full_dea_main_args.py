@@ -146,6 +146,29 @@ def test_rods_rejects_dea_lite_lambdas() -> None:
         ))
 
 
+def test_tfds_projection_uses_honest_method_name_and_instance_maps() -> None:
+    args = validate_args(make_args(
+        deep_supervision="tfds_projection",
+        tfds_min_iou=0.5,
+        tfds_max_centroid_distance=3.0,
+    ))
+
+    assert get_method_name(args) == "TCDS-Projection"
+    assert args.return_instance_map is True
+    metadata = get_method_metadata(args)
+    assert metadata["deep_supervision"] == "tfds_projection"
+    assert metadata["tfds_min_iou"] == 0.5
+    assert metadata["tfds_max_centroid_distance"] == 3.0
+
+
+def test_tfds_projection_rejects_invalid_task_thresholds() -> None:
+    with pytest.raises(ValueError, match="tfds-min-iou"):
+        validate_args(make_args(
+            deep_supervision="tfds_projection",
+            tfds_min_iou=1.1,
+        ))
+
+
 def test_rods_checkpoint_metadata_rejects_ownership_mismatch() -> None:
     args = validate_args(make_args(
         deep_supervision="rods_interval",

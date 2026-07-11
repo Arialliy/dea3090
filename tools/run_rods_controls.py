@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
-"""Run RODS and matched deep-supervision controls on fixed holdout splits.
+"""Run exploratory RODS and deep-supervision controls on fixed holdout splits.
 
 The runner mirrors ``run_clean_baselines.py``: it uses official training
 manifests for fitting, deterministic internal holdouts for model selection,
 and only opens official test manifests for split provenance and leakage
 audits performed by ``main.py``.
+
+``rods_random`` is an unmatched random control retained for the archived RODS
+prototype.  It must not be described as the degree/pixel-matched TFDS control.
 """
 
 from __future__ import annotations

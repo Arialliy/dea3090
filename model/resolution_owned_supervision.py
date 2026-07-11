@@ -14,6 +14,7 @@ class ResolutionOwnedAssignment:
     utility: list[torch.Tensor]
     component_ids: list[torch.Tensor]
     strides: tuple[int, ...]
+    min_decidability: float
 
 
 class ResolutionDecidableSupervisionGraph:
@@ -100,6 +101,7 @@ class ResolutionDecidableSupervisionGraph:
             utility=utility,
             component_ids=component_ids,
             strides=self.strides,
+            min_decidability=self.min_decidability,
         )
 
     def _component_scores(

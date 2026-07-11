@@ -130,7 +130,9 @@ def update_counters(counters: dict[str, Any], assignment: Any) -> None:
     decidability = assignment.decidability[0]
     counters["component_count"] += int(ids.numel())
     owned = responsibilities > 0
-    decidable = decidability > 0
+    # Report the same predicate that the training graph actually uses.  A
+    # positive heuristic score alone is not an active/decidable edge.
+    decidable = decidability >= float(assignment.min_decidability)
     for side_index in range(owned.shape[1]):
         counters["owned_counts"][side_index] += int(owned[:, side_index].sum().item())
         counters["decidable_counts"][side_index] += int(

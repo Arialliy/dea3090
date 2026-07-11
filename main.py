@@ -26,6 +26,11 @@ from model.resolution_owned_supervision import (
     OwnedSideSupervisionBuilder,
     ResolutionDecidableSupervisionGraph,
 )
+from model.partial_sls_loss import PartialSLSIoULoss
+from model.task_consistent_supervision import (
+    TaskConsistentPartialTargetBuilder,
+    TaskConsistentProjectionGraph,
+)
 from torch.optim import Adagrad
 from tqdm import tqdm
 import os.path as osp
@@ -47,6 +52,7 @@ RODS_DEEP_SUPERVISION_TYPES = (
     'rods_random',
     'rods_area_only',
 )
+TFDS_DEEP_SUPERVISION_TYPES = ('tfds_projection',)
 
 
 def is_dea_main_model(model_type):
@@ -57,6 +63,9 @@ def is_cev_control(model_type):
 
 def is_rods_deep_supervision(deep_supervision):
     return deep_supervision in RODS_DEEP_SUPERVISION_TYPES
+
+def is_tfds_deep_supervision(deep_supervision):
+    return deep_supervision in TFDS_DEEP_SUPERVISION_TYPES
 
 def str2bool(value):
     if isinstance(value, bool):
@@ -112,7 +121,7 @@ def validate_args(args):
         "legacy_rescaled",
         "final_only",
         "side_no_location",
-    ) + RODS_DEEP_SUPERVISION_TYPES
+    ) + RODS_DEEP_SUPERVISION_TYPES + TFDS_DEEP_SUPERVISION_TYPES
     if args.deep_supervision not in deep_supervision_choices:
         raise ValueError("--deep-supervision has an unsupported value.")
     defaults = {
@@ -125,6 +134,8 @@ def validate_args(args):
         "ownership_ignore_dilation": 3,
         "empty_side_policy": "skip",
         "rods_log_interval": 50,
+        "tfds_min_iou": 0.5,
+        "tfds_max_centroid_distance": 3.0,
     }
     for key, value in defaults.items():
         if not hasattr(args, key):
@@ -159,11 +170,18 @@ def validate_args(args):
         raise ValueError("--empty-side-policy must be skip or background_only.")
     if int(getattr(args, "rods_log_interval", 50)) < 0:
         raise ValueError("--rods-log-interval must be non-negative.")
+    if not 0.0 <= float(args.tfds_min_iou) <= 1.0:
+        raise ValueError("--tfds-min-iou must be in [0, 1].")
+    if float(args.tfds_max_centroid_distance) <= 0.0:
+        raise ValueError("--tfds-max-centroid-distance must be positive.")
     if int(getattr(args, "ownership_ignore_dilation", 3)) <= 0 or (
         int(getattr(args, "ownership_ignore_dilation", 3)) % 2 == 0
     ):
         raise ValueError("--ownership-ignore-dilation must be a positive odd integer.")
-    args.return_instance_map = is_rods_deep_supervision(args.deep_supervision)
+    args.return_instance_map = (
+        is_rods_deep_supervision(args.deep_supervision)
+        or is_tfds_deep_supervision(args.deep_supervision)
+    )
 
     if args.model_type == "dea_integrated":
         if args.if_checkpoint and args.init_from_baseline:
@@ -333,6 +351,7 @@ def get_method_name(args):
             "rods_hard": "RODS-Hard",
             "rods_random": "RODS-Random",
             "rods_area_only": "RODS-AreaOnly",
+            "tfds_projection": "TCDS-Projection",
         }
         return names.get(deep_supervision, "MSHNet-" + deep_supervision)
     if is_cev_control(args.model_type):
@@ -457,6 +476,10 @@ def get_method_metadata(args):
         ),
         "empty_side_policy": getattr(args, "empty_side_policy", "skip"),
         "rods_log_interval": int(getattr(args, "rods_log_interval", 50)),
+        "tfds_min_iou": float(getattr(args, "tfds_min_iou", 0.5)),
+        "tfds_max_centroid_distance": float(
+            getattr(args, "tfds_max_centroid_distance", 3.0)
+        ),
         "predictive_state_channels": int(
             getattr(args, "predictive_state_channels", 32)
         ),
@@ -576,6 +599,7 @@ def parse_args():
             'rods_hard',
             'rods_random',
             'rods_area_only',
+            'tfds_projection',
         ],
         help='Deep-supervision training topology for MSHNet.',
     )
@@ -598,6 +622,8 @@ def parse_args():
         choices=['skip', 'background_only'],
     )
     parser.add_argument('--rods-log-interval', type=int, default=50)
+    parser.add_argument('--tfds-min-iou', type=float, default=0.5)
+    parser.add_argument('--tfds-max-centroid-distance', type=float, default=3.0)
     parser.add_argument('--init-from-baseline', type=str, default='')
     parser.add_argument('--cev-kernel-size', type=int, default=7)
     parser.add_argument('--cev-initial-bias', type=float, default=-6.0)
@@ -853,6 +879,7 @@ class Trainer(object):
         self.down = nn.MaxPool2d(2, 2)
         self.loss_fun = SLSIoULoss()
         self.masked_owned_loss = MaskedOwnedScaleIoULoss()
+        self.partial_sls_loss = PartialSLSIoULoss()
         self.last_deep_supervision_log = {}
         graph_mode = {
             "rods_interval": "interval",
@@ -871,6 +898,11 @@ class Trainer(object):
         self.owned_supervision_builder = OwnedSideSupervisionBuilder(
             ignore_dilation=args.ownership_ignore_dilation,
         )
+        self.task_consistent_graph = TaskConsistentProjectionGraph(
+            min_iou=args.tfds_min_iou,
+            max_centroid_distance=args.tfds_max_centroid_distance,
+        )
+        self.task_consistent_target_builder = TaskConsistentPartialTargetBuilder()
         self.PD_FA = PD_FA(1, 10, args.base_size)
         self.mIoU = mIoU(1)
         self.ROC  = ROCMetric(1, 10)
@@ -1094,6 +1126,19 @@ class Trainer(object):
                 'dea_delta_init',
                 'dea_delta_min',
                 'dea_legacy_numerics',
+                'test_split_sha256',
+            )
+        elif (
+            self.args.model_type == 'mshnet'
+            and is_tfds_deep_supervision(
+                getattr(self.args, "deep_supervision", "")
+            )
+        ):
+            semantic_keys = (
+                'model_type',
+                'deep_supervision',
+                'tfds_min_iou',
+                'tfds_max_centroid_distance',
                 'test_split_sha256',
             )
         elif self.args.model_type == 'mshnet':
@@ -1593,6 +1638,49 @@ class Trainer(object):
         if not masks or mode == "final_only":
             return final_loss
 
+        if is_tfds_deep_supervision(mode):
+            if instance_map is None:
+                raise RuntimeError("%s requires return_instance_map batches" % mode)
+            assignment = self.task_consistent_graph(instance_map)
+            side_losses = []
+            log_vars = {}
+            for side_index, side_logit in enumerate(masks):
+                target, valid, active = self.task_consistent_target_builder(
+                    instance_map,
+                    assignment,
+                    side_index,
+                )
+                side_loss = self.partial_sls_loss(
+                    side_logit,
+                    target,
+                    valid,
+                    self.warm_epoch,
+                    epoch,
+                )
+                side_losses.append(side_loss)
+                graph_values = [
+                    graph[:, side_index].float()
+                    for graph in assignment.feasible
+                    if graph.numel() > 0
+                ]
+                feasible_ratio = (
+                    torch.cat(graph_values).mean()
+                    if graph_values
+                    else side_logit.new_zeros(())
+                )
+                log_vars["side%d_loss" % side_index] = side_loss.detach()
+                log_vars["side%d_active_ratio" % side_index] = active.float().mean()
+                log_vars["side%d_valid_ratio" % side_index] = valid.mean()
+                log_vars["side%d_feasible_ratio" % side_index] = feasible_ratio.detach()
+
+            # Preserve canonical MSHNet's exact five-objective aggregation.
+            total = (final_loss + torch.stack(side_losses).sum()) / (
+                len(side_losses) + 1
+            )
+            self.last_deep_supervision_log.update(log_vars)
+            self.last_deep_supervision_log["canonical_aggregation"] = 1.0
+            return total
+
         if mode in ("legacy_rescaled", "side_no_location"):
             labels_for_scale = labels
             aux_losses = []
@@ -1741,12 +1829,26 @@ class Trainer(object):
                 )
             loss_seg_for_debug = loss.detach()
             if (
-                is_rods_deep_supervision(getattr(self.args, "deep_supervision", ""))
+                (
+                    is_rods_deep_supervision(
+                        getattr(self.args, "deep_supervision", "")
+                    )
+                    or is_tfds_deep_supervision(
+                        getattr(self.args, "deep_supervision", "")
+                    )
+                )
                 and self.args.rods_log_interval > 0
                 and i % self.args.rods_log_interval == 0
             ):
                 msg = self.format_log_dict(self.last_deep_supervision_log)
-                print('[RODS] ' + ' | '.join(msg))
+                prefix = (
+                    '[TCDS] '
+                    if is_tfds_deep_supervision(
+                        getattr(self.args, "deep_supervision", "")
+                    )
+                    else '[RODS] '
+                )
+                print(prefix + ' | '.join(msg))
             integrated_route_loss = None
             integrated_route_log = {}
             integrated_route_ramp = 0.0
