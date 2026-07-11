@@ -21,6 +21,11 @@ from model.full_dea_loss import (
     full_dea_aux_loss_v3,
     full_dea_aux_loss_v4,
 )
+from model.masked_owned_loss import MaskedOwnedScaleIoULoss
+from model.resolution_owned_supervision import (
+    OwnedSideSupervisionBuilder,
+    ResolutionDecidableSupervisionGraph,
+)
 from torch.optim import Adagrad
 from tqdm import tqdm
 import os.path as osp
@@ -36,6 +41,12 @@ DEFAULT_DATASET_DIR = osp.join(PROJECT_DIR, 'datasets', 'IRSTD-1K')
 DEFAULT_WEIGHT_DIR = osp.join(PROJECT_DIR, 'weight')
 DEA_MODEL_TYPES = ('dea', 'predictive_correction')
 CEV_CONTROL_TYPES = ('dea_fine_veto_control', 'dea_cev_control')
+RODS_DEEP_SUPERVISION_TYPES = (
+    'rods_interval',
+    'rods_hard',
+    'rods_random',
+    'rods_area_only',
+)
 
 
 def is_dea_main_model(model_type):
@@ -43,6 +54,9 @@ def is_dea_main_model(model_type):
 
 def is_cev_control(model_type):
     return model_type in CEV_CONTROL_TYPES
+
+def is_rods_deep_supervision(deep_supervision):
+    return deep_supervision in RODS_DEEP_SUPERVISION_TYPES
 
 def str2bool(value):
     if isinstance(value, bool):
@@ -89,6 +103,67 @@ def seed_worker(worker_id):
 def validate_args(args):
     if getattr(args, "mode", "train") not in ("train", "test"):
         raise ValueError("--mode must be train or test.")
+    if not hasattr(args, "deep_supervision"):
+        args.deep_supervision = "legacy_exact"
+    if args.deep_supervision == "legacy":
+        args.deep_supervision = "legacy_exact"
+    deep_supervision_choices = (
+        "legacy_exact",
+        "legacy_rescaled",
+        "final_only",
+        "side_no_location",
+    ) + RODS_DEEP_SUPERVISION_TYPES
+    if args.deep_supervision not in deep_supervision_choices:
+        raise ValueError("--deep-supervision has an unsupported value.")
+    defaults = {
+        "aux_loss_weight": 0.8,
+        "ownership_preferred_cells": 3.0,
+        "ownership_sigma": 0.75,
+        "ownership_min_decidability": 0.25,
+        "ownership_interval_ratio": 0.5,
+        "ownership_fallback": "side0",
+        "ownership_ignore_dilation": 3,
+        "empty_side_policy": "skip",
+        "rods_log_interval": 50,
+    }
+    for key, value in defaults.items():
+        if not hasattr(args, key):
+            setattr(args, key, value)
+    if args.deep_supervision != "legacy_exact" and args.model_type != "mshnet":
+        raise ValueError(
+            "--deep-supervision modes other than legacy_exact are currently "
+            "implemented only for --model-type mshnet."
+        )
+    if args.deep_supervision != "legacy_exact":
+        lite_lambdas = (
+            args.dea_lambda_single,
+            args.dea_lambda_dec,
+            args.dea_lambda_empty,
+        )
+        if any(float(value) != 0.0 for value in lite_lambdas):
+            raise ValueError(
+                "RODS/alternative deep supervision must not be mixed with "
+                "DEA-lite losses."
+            )
+    if float(getattr(args, "aux_loss_weight", 0.8)) < 0.0:
+        raise ValueError("--aux-loss-weight must be non-negative.")
+    if float(getattr(args, "ownership_sigma", 0.75)) <= 0.0:
+        raise ValueError("--ownership-sigma must be positive.")
+    if float(getattr(args, "ownership_preferred_cells", 3.0)) <= 0.0:
+        raise ValueError("--ownership-preferred-cells must be positive.")
+    if float(getattr(args, "ownership_interval_ratio", 0.5)) < 0.0:
+        raise ValueError("--ownership-interval-ratio must be non-negative.")
+    if args.ownership_fallback not in ("side0", "final_only"):
+        raise ValueError("--ownership-fallback must be side0 or final_only.")
+    if args.empty_side_policy not in ("skip", "background_only"):
+        raise ValueError("--empty-side-policy must be skip or background_only.")
+    if int(getattr(args, "rods_log_interval", 50)) < 0:
+        raise ValueError("--rods-log-interval must be non-negative.")
+    if int(getattr(args, "ownership_ignore_dilation", 3)) <= 0 or (
+        int(getattr(args, "ownership_ignore_dilation", 3)) % 2 == 0
+    ):
+        raise ValueError("--ownership-ignore-dilation must be a positive odd integer.")
+    args.return_instance_map = is_rods_deep_supervision(args.deep_supervision)
 
     if args.model_type == "dea_integrated":
         if args.if_checkpoint and args.init_from_baseline:
@@ -246,6 +321,20 @@ def validate_args(args):
     return args
 
 def get_method_name(args):
+    deep_supervision = getattr(args, "deep_supervision", "legacy_exact")
+    if deep_supervision == "legacy":
+        deep_supervision = "legacy_exact"
+    if args.model_type == "mshnet" and deep_supervision != "legacy_exact":
+        names = {
+            "legacy_rescaled": "MSHNet-LegacyRescaled",
+            "final_only": "MSHNet-FinalOnly",
+            "side_no_location": "MSHNet-SideNoLocation",
+            "rods_interval": "RODS-Interval",
+            "rods_hard": "RODS-Hard",
+            "rods_random": "RODS-Random",
+            "rods_area_only": "RODS-AreaOnly",
+        }
+        return names.get(deep_supervision, "MSHNet-" + deep_supervision)
     if is_cev_control(args.model_type):
         kernel = int(getattr(args, "cev_kernel_size", 7))
         if args.model_type == "dea_fine_veto_control":
@@ -350,6 +439,24 @@ def get_method_metadata(args):
         "integrated_isolate_route_gradients": bool(
             getattr(args, "integrated_isolate_route_gradients", True)
         ),
+        "deep_supervision": getattr(args, "deep_supervision", "legacy_exact"),
+        "aux_loss_weight": float(getattr(args, "aux_loss_weight", 0.8)),
+        "ownership_preferred_cells": float(
+            getattr(args, "ownership_preferred_cells", 3.0)
+        ),
+        "ownership_sigma": float(getattr(args, "ownership_sigma", 0.75)),
+        "ownership_min_decidability": float(
+            getattr(args, "ownership_min_decidability", 0.25)
+        ),
+        "ownership_interval_ratio": float(
+            getattr(args, "ownership_interval_ratio", 0.5)
+        ),
+        "ownership_fallback": getattr(args, "ownership_fallback", "side0"),
+        "ownership_ignore_dilation": int(
+            getattr(args, "ownership_ignore_dilation", 3)
+        ),
+        "empty_side_policy": getattr(args, "empty_side_policy", "skip"),
+        "rods_log_interval": int(getattr(args, "rods_log_interval", 50)),
         "predictive_state_channels": int(
             getattr(args, "predictive_state_channels", 32)
         ),
@@ -455,6 +562,42 @@ def parse_args():
             'dea_cev_control',
         ],
     )
+    parser.add_argument(
+        '--deep-supervision',
+        type=str,
+        default='legacy_exact',
+        choices=[
+            'legacy',
+            'legacy_exact',
+            'legacy_rescaled',
+            'final_only',
+            'side_no_location',
+            'rods_interval',
+            'rods_hard',
+            'rods_random',
+            'rods_area_only',
+        ],
+        help='Deep-supervision training topology for MSHNet.',
+    )
+    parser.add_argument('--aux-loss-weight', type=float, default=0.8)
+    parser.add_argument('--ownership-preferred-cells', type=float, default=3.0)
+    parser.add_argument('--ownership-sigma', type=float, default=0.75)
+    parser.add_argument('--ownership-min-decidability', type=float, default=0.25)
+    parser.add_argument('--ownership-interval-ratio', type=float, default=0.5)
+    parser.add_argument(
+        '--ownership-fallback',
+        type=str,
+        default='side0',
+        choices=['side0', 'final_only'],
+    )
+    parser.add_argument('--ownership-ignore-dilation', type=int, default=3)
+    parser.add_argument(
+        '--empty-side-policy',
+        type=str,
+        default='skip',
+        choices=['skip', 'background_only'],
+    )
+    parser.add_argument('--rods-log-interval', type=int, default=50)
     parser.add_argument('--init-from-baseline', type=str, default='')
     parser.add_argument('--cev-kernel-size', type=int, default=7)
     parser.add_argument('--cev-initial-bias', type=float, default=-6.0)
@@ -709,6 +852,25 @@ class Trainer(object):
 
         self.down = nn.MaxPool2d(2, 2)
         self.loss_fun = SLSIoULoss()
+        self.masked_owned_loss = MaskedOwnedScaleIoULoss()
+        self.last_deep_supervision_log = {}
+        graph_mode = {
+            "rods_interval": "interval",
+            "rods_hard": "hard",
+            "rods_random": "random",
+            "rods_area_only": "area_only",
+        }.get(getattr(args, "deep_supervision", "legacy_exact"), "interval")
+        self.resolution_graph = ResolutionDecidableSupervisionGraph(
+            preferred_diameter_cells=args.ownership_preferred_cells,
+            sigma=args.ownership_sigma,
+            min_decidability=args.ownership_min_decidability,
+            interval_ratio=args.ownership_interval_ratio,
+            mode=graph_mode,
+            fallback=args.ownership_fallback,
+        )
+        self.owned_supervision_builder = OwnedSideSupervisionBuilder(
+            ignore_dilation=args.ownership_ignore_dilation,
+        )
         self.PD_FA = PD_FA(1, 10, args.base_size)
         self.mIoU = mIoU(1)
         self.ROC  = ROCMetric(1, 10)
@@ -871,6 +1033,11 @@ class Trainer(object):
             self.args.model_type != 'dea_integrated'
             and not is_dea_main_model(self.args.model_type)
             and not is_cev_control(self.args.model_type)
+            and not (
+                self.args.model_type == 'mshnet'
+                and getattr(self.args, "deep_supervision", "legacy_exact")
+                != "legacy_exact"
+            )
         ):
             return
         if not isinstance(checkpoint, dict) or 'method_meta' not in checkpoint:
@@ -918,7 +1085,7 @@ class Trainer(object):
                 'predictive_legacy_numerics',
                 'test_split_sha256',
             )
-        else:
+        elif is_dea_main_model(self.args.model_type):
             semantic_keys = (
                 'model_type',
                 'dea_version',
@@ -927,6 +1094,20 @@ class Trainer(object):
                 'dea_delta_init',
                 'dea_delta_min',
                 'dea_legacy_numerics',
+                'test_split_sha256',
+            )
+        elif self.args.model_type == 'mshnet':
+            semantic_keys = (
+                'model_type',
+                'deep_supervision',
+                'aux_loss_weight',
+                'ownership_preferred_cells',
+                'ownership_sigma',
+                'ownership_min_decidability',
+                'ownership_interval_ratio',
+                'ownership_fallback',
+                'ownership_ignore_dilation',
+                'empty_side_policy',
                 'test_split_sha256',
             )
         if check_split_hashes:
@@ -1374,15 +1555,124 @@ class Trainer(object):
             + 0.2 * loss_eighth
         )
 
+    @staticmethod
+    def unpack_batch(batch):
+        if len(batch) == 3:
+            return batch[0], batch[1], batch[2]
+        if len(batch) == 2:
+            return batch[0], batch[1], None
+        raise RuntimeError("unexpected dataloader batch arity: %d" % len(batch))
+
+    def compute_deep_supervision_loss(
+        self,
+        pred,
+        masks,
+        labels,
+        instance_map,
+        epoch,
+    ):
+        mode = getattr(self.args, "deep_supervision", "legacy_exact")
+        if mode == "legacy":
+            mode = "legacy_exact"
+
+        final_loss = self.loss_fun(pred, labels, self.warm_epoch, epoch)
+        self.last_deep_supervision_log = {
+            "final_loss_raw": final_loss.detach(),
+        }
+        if mode == "legacy_exact":
+            loss = final_loss
+            labels_for_scale = labels
+            for j in range(len(masks)):
+                if j > 0:
+                    labels_for_scale = self.down(labels_for_scale)
+                loss = loss + self.loss_fun(
+                    masks[j], labels_for_scale, self.warm_epoch, epoch
+                )
+            return loss / (len(masks) + 1)
+
+        if not masks or mode == "final_only":
+            return final_loss
+
+        if mode in ("legacy_rescaled", "side_no_location"):
+            labels_for_scale = labels
+            aux_losses = []
+            for j, side_logit in enumerate(masks):
+                if j > 0:
+                    labels_for_scale = self.down(labels_for_scale)
+                aux_losses.append(
+                    self.loss_fun(
+                        side_logit,
+                        labels_for_scale,
+                        self.warm_epoch,
+                        epoch,
+                        with_shape=(mode == "legacy_rescaled"),
+                    )
+                )
+            aux_loss = torch.stack(aux_losses).mean()
+            self.last_deep_supervision_log.update(
+                {
+                    "aux_loss_raw": aux_loss.detach(),
+                    "aux_loss_weighted": (
+                        self.args.aux_loss_weight * aux_loss
+                    ).detach(),
+                }
+            )
+            return final_loss + self.args.aux_loss_weight * aux_loss
+
+        if not is_rods_deep_supervision(mode):
+            raise RuntimeError("unsupported deep supervision mode: %s" % mode)
+        if instance_map is None:
+            raise RuntimeError("%s requires return_instance_map batches" % mode)
+
+        assignment = self.resolution_graph(instance_map)
+        aux_terms = []
+        log_vars = {}
+        for side_index, side_logit in enumerate(masks):
+            target, valid, weight, active = self.owned_supervision_builder(
+                instance_map,
+                assignment,
+                side_index,
+            )
+            per_sample = self.masked_owned_loss(side_logit, target, valid, weight)
+            if self.args.empty_side_policy == "skip":
+                active = active.to(dtype=per_sample.dtype)
+                active_sum = active.sum()
+                if bool((active_sum > 0).detach().cpu()):
+                    side_loss = (per_sample * active).sum() / active_sum.clamp_min(1.0)
+                else:
+                    side_loss = per_sample.sum() * 0.0
+            else:
+                side_loss = per_sample.mean()
+            aux_terms.append(side_loss)
+            log_vars["side%d_loss" % side_index] = side_loss.detach()
+            log_vars["side%d_active_ratio" % side_index] = active.float().mean().detach()
+            log_vars["side%d_valid_ratio" % side_index] = valid.detach().mean()
+            log_vars["side%d_pos_ratio" % side_index] = target.detach().mean()
+
+        aux_loss = torch.stack(aux_terms).mean()
+        self.last_deep_supervision_log.update(
+            {
+                "aux_loss_raw": aux_loss.detach(),
+                "aux_loss_weighted": (
+                    self.args.aux_loss_weight * aux_loss
+                ).detach(),
+            }
+        )
+        self.last_deep_supervision_log.update(log_vars)
+        return final_loss + self.args.aux_loss_weight * aux_loss
+
     def train(self, epoch):
         self.model.train()
         self.configure_full_dea_trainable(epoch)
         tbar = tqdm(self.train_loader)
         losses = AverageMeter()
-        for i, (data, mask) in enumerate(tbar):
+        for i, batch in enumerate(tbar):
+            data, mask, instance_map = self.unpack_batch(batch)
   
             data = data.to(self.device, non_blocking=True)
             labels = mask.to(self.device, non_blocking=True)
+            if instance_map is not None:
+                instance_map = instance_map.to(self.device, non_blocking=True)
 
             tag = self.get_forward_tag(epoch)
             use_dea = self.use_dea(epoch)
@@ -1442,16 +1732,21 @@ class Trainer(object):
                     dea_main_out["state_logits"], labels, epoch
                 )
             else:
-                loss = self.loss_fun(pred, labels, self.warm_epoch, epoch)
-                labels_for_scale = labels
-                for j in range(len(masks)):
-                    if j>0:
-                        labels_for_scale = self.down(labels_for_scale)
-                    loss = loss + self.loss_fun(
-                        masks[j], labels_for_scale, self.warm_epoch, epoch
-                    )
-                loss = loss / (len(masks)+1)
+                loss = self.compute_deep_supervision_loss(
+                    pred,
+                    masks,
+                    labels,
+                    instance_map,
+                    epoch,
+                )
             loss_seg_for_debug = loss.detach()
+            if (
+                is_rods_deep_supervision(getattr(self.args, "deep_supervision", ""))
+                and self.args.rods_log_interval > 0
+                and i % self.args.rods_log_interval == 0
+            ):
+                msg = self.format_log_dict(self.last_deep_supervision_log)
+                print('[RODS] ' + ' | '.join(msg))
             integrated_route_loss = None
             integrated_route_log = {}
             integrated_route_ramp = 0.0
@@ -1633,7 +1928,8 @@ class Trainer(object):
             else None
         )
         with torch.no_grad():
-            for i, (data, mask) in enumerate(tbar):
+            for i, batch in enumerate(tbar):
+                data, mask, _instance_map = self.unpack_batch(batch)
     
                 data = data.to(self.device, non_blocking=True)
                 mask = mask.to(self.device, non_blocking=True)

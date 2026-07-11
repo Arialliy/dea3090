@@ -117,6 +117,63 @@ def test_method_metadata_persists_run_label() -> None:
     assert get_method_metadata(args)["run_label"] == "nuaa_seed_11"
 
 
+def test_rods_method_metadata_and_instance_map_flag() -> None:
+    args = validate_args(make_args(
+        deep_supervision="rods_interval",
+        aux_loss_weight=0.8,
+        ownership_preferred_cells=3.0,
+        ownership_sigma=0.75,
+        ownership_min_decidability=0.25,
+        ownership_interval_ratio=0.5,
+        ownership_fallback="side0",
+        ownership_ignore_dilation=3,
+        empty_side_policy="skip",
+    ))
+
+    assert get_method_name(args) == "RODS-Interval"
+    assert args.return_instance_map is True
+    metadata = get_method_metadata(args)
+    assert metadata["method"] == "RODS-Interval"
+    assert metadata["deep_supervision"] == "rods_interval"
+    assert metadata["ownership_sigma"] == 0.75
+
+
+def test_rods_rejects_dea_lite_lambdas() -> None:
+    with pytest.raises(ValueError, match="must not be mixed"):
+        validate_args(make_args(
+            deep_supervision="rods_hard",
+            dea_lambda_single=0.01,
+        ))
+
+
+def test_rods_checkpoint_metadata_rejects_ownership_mismatch() -> None:
+    args = validate_args(make_args(
+        deep_supervision="rods_interval",
+        aux_loss_weight=0.8,
+        ownership_preferred_cells=3.0,
+        ownership_sigma=0.75,
+        ownership_min_decidability=0.25,
+        ownership_interval_ratio=0.5,
+        ownership_fallback="side0",
+        ownership_ignore_dilation=3,
+        empty_side_policy="skip",
+    ))
+    trainer = Trainer.__new__(Trainer)
+    trainer.args = args
+    metadata = get_method_metadata(args)
+
+    Trainer.validate_integrated_checkpoint_metadata(
+        trainer, {"method_meta": metadata}, check_split_hashes=False
+    )
+
+    incompatible = dict(metadata)
+    incompatible["ownership_sigma"] = 0.5
+    with pytest.raises(RuntimeError, match="ownership_sigma"):
+        Trainer.validate_integrated_checkpoint_metadata(
+            trainer, {"method_meta": incompatible}, check_split_hashes=False
+        )
+
+
 def test_integrated_method_name_exposes_residual_alignment() -> None:
     args = validate_args(make_args(model_type="dea_integrated"))
     assert get_method_name(args) == "DEAIntegrated-ResidualAligned"

@@ -11,6 +11,8 @@ import random
 import shutil
 import glob
 import hashlib
+import numpy as np
+from skimage import measure
 
 
 class IRSTD_Dataset(Data.Dataset):
@@ -60,6 +62,10 @@ class IRSTD_Dataset(Data.Dataset):
             transforms.ToTensor(),
             transforms.Normalize([.485, .456, .406], [.229, .224, .225]),
         ])
+        self.return_instance_map = (
+            bool(getattr(args, 'return_instance_map', False))
+            and mode in ('train', 'val')
+        )
         self.split_sha256 = hashlib.sha256(
             ('\n'.join(self.names) + '\n').encode('utf-8')
         ).hexdigest()
@@ -152,8 +158,15 @@ class IRSTD_Dataset(Data.Dataset):
         else:
             raise ValueError("Unknown self.mode")
 
-        
-        img, mask = self.transform(img), transforms.ToTensor()(mask)
+        img = self.transform(img)
+        mask = transforms.ToTensor()(mask)
+        if self.return_instance_map:
+            labels = measure.label(
+                (mask[0].numpy() > 0.5).astype(np.uint8),
+                connectivity=2,
+                background=0,
+            ).astype(np.int32)
+            return img, mask, torch.from_numpy(labels)
         return img, mask
 
     def __len__(self):
