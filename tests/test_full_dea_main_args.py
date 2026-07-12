@@ -276,12 +276,89 @@ def test_crs_persists_counterfactual_constraint_semantics() -> None:
     assert metadata["crs_ramp_epochs"] == 10
     assert metadata["crs_safe_kernel"] == 15
     assert metadata["crs_detach_scale_evidence"] is True
+    assert metadata["sdrr_normalization"] == "event"
 
     with pytest.raises(ValueError, match="crs-safe-kernel"):
         validate_args(make_args(
             deep_supervision="crs_flip_suppression",
             crs_safe_kernel=8,
         ))
+
+
+def test_sdrr_normalization_controls_are_named_and_validated() -> None:
+    args = validate_args(
+        make_args(
+            deep_supervision="crs_flip_suppression",
+            sdrr_normalization="unique_pixel",
+        )
+    )
+    assert get_method_name(args) == "SDRR-NormalizationControl-unique_pixel"
+    assert get_method_metadata(args)["sdrr_normalization"] == "unique_pixel"
+
+    with pytest.raises(ValueError, match="sdrr-normalization"):
+        validate_args(
+            make_args(
+                deep_supervision="crs_flip_suppression",
+                sdrr_normalization="invalid",
+            )
+        )
+
+
+def test_crs_matched_random_is_explicit_ablation_not_main_method() -> None:
+    args = validate_args(make_args(
+        deep_supervision="crs_matched_random",
+        crs_lambda=0.05,
+        crs_start_epoch=250,
+        crs_ramp_epochs=50,
+        crs_safe_kernel=15,
+    ))
+
+    assert get_method_name(args) == "SDRR-ScaleBudgetRandomControl-Unmatched"
+    assert args.return_instance_map is False
+    metadata = get_method_metadata(args)
+    assert metadata["deep_supervision"] == "crs_matched_random"
+    assert metadata["crs_start_epoch"] == 250
+
+
+def test_same_pixel_random_scale_control_is_explicit() -> None:
+    args = validate_args(
+        make_args(deep_supervision="crs_same_pixel_random_scale")
+    )
+    assert get_method_name(args) == "SDRR-SamePixelRandomScaleControl"
+    assert args.return_instance_map is False
+
+
+def test_magnitude_nonpivotal_control_is_explicit() -> None:
+    args = validate_args(make_args(deep_supervision="crs_magnitude_nonpivotal"))
+    assert (
+        get_method_name(args)
+        == "SDRR-MagnitudeMatchedNonPivotalControl"
+    )
+    assert args.return_instance_map is False
+
+
+def test_clean_mshnet_variants_are_physically_explicit() -> None:
+    official = validate_args(make_args(mshnet_variant="official"))
+    deterministic = validate_args(make_args(mshnet_variant="deterministic"))
+
+    assert get_method_name(official) == "MSHNet-OfficialForward"
+    assert get_method_name(deterministic) == "MSHNet-Deterministic"
+    assert get_method_metadata(official)["mshnet_variant"] == "official"
+    assert get_method_metadata(deterministic)["mshnet_variant"] == "deterministic"
+
+
+def test_clean_mshnet_rejects_workbench_only_forward_switches() -> None:
+    with pytest.raises(ValueError, match="DEA-lite"):
+        validate_args(
+            make_args(mshnet_variant="deterministic", dea_lambda_single=0.1)
+        )
+    with pytest.raises(ValueError, match="fusion_alpha"):
+        validate_args(
+            make_args(
+                mshnet_variant="deterministic",
+                deep_supervision="hms_continuation",
+            )
+        )
 
 
 @pytest.mark.parametrize(

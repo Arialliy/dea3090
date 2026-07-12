@@ -7,7 +7,11 @@ from main import Trainer
 from model.MSHNet import MSHNet
 from model.counterfactual_responsibility import (
     build_safe_background,
+    build_responsibility_mask,
     counterfactual_responsibility_suppression,
+    matched_random_responsibility_suppression,
+    magnitude_matched_nonpivotal_suppression,
+    same_pixel_random_scale_suppression,
 )
 from model.loss import SLSIoULoss
 from model.scale_coalition_supervision import leave_one_scale_out_coalitions
@@ -68,6 +72,141 @@ def test_no_flip_has_exact_zero_loss_and_gradient() -> None:
     assert loss.item() == 0.0
     torch.testing.assert_close(contributions.grad, torch.zeros_like(contributions))
     assert logs["responsible_count"] == 0
+
+
+def test_matched_random_control_matches_per_scale_budget_without_overlap() -> None:
+    z_full = torch.ones(1, 1, 1, 8)
+    contributions = torch.zeros(1, 4, 1, 8, requires_grad=True)
+    with torch.no_grad():
+        contributions[0, 0, 0] = torch.tensor(
+            [2.0, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8]
+        )
+        contributions[0, 1, 0] = torch.tensor(
+            [0.2, 2.0, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8]
+        )
+    target = torch.zeros_like(z_full)
+
+    loss, logs = matched_random_responsibility_suppression(
+        z_full, contributions, target, safe_kernel=1, salt=37
+    )
+    loss.backward()
+
+    responsibility = build_responsibility_mask(
+        z_full, contributions.detach(), build_safe_background(target, 1)
+    ).bool()
+    selected = contributions.grad != 0
+    assert torch.equal(selected.sum(dim=(-2, -1)), responsibility.sum(dim=(-2, -1)))
+    assert not bool((selected & responsibility).any())
+    assert logs["responsible_count"] == 2
+    assert logs["control_selected_count"] == 2
+    assert logs["control_shortage_count"] == 0
+    assert logs["control_budget_match_ratio"] == 1
+
+
+def test_matched_random_control_no_event_is_exact_zero() -> None:
+    z_full = torch.ones(1, 1, 2, 2)
+    contributions = torch.full((1, 4, 2, 2), 0.1, requires_grad=True)
+    loss, logs = matched_random_responsibility_suppression(
+        z_full,
+        contributions,
+        torch.zeros_like(z_full),
+        safe_kernel=1,
+        salt=11,
+    )
+    loss.backward()
+
+    assert loss.item() == 0.0
+    torch.testing.assert_close(contributions.grad, torch.zeros_like(contributions))
+    assert logs["responsible_count"] == 0
+    assert logs["control_selected_count"] == 0
+
+
+def test_sdrr_normalization_controls_have_the_documented_denominators() -> None:
+    z_full = torch.ones(1, 1, 1, 2)
+    contributions = torch.zeros(1, 4, 1, 2)
+    contributions[0, 0, 0, 0] = 2.0
+    contributions[0, 1, 0, 0] = 3.0
+    contributions[0, 0, 0, 1] = 4.0
+    target = torch.zeros_like(z_full)
+    penalties = torch.nn.functional.softplus(contributions)
+    numerator = penalties[0, 0, 0, 0] + penalties[0, 1, 0, 0] + penalties[0, 0, 0, 1]
+
+    event_loss, event_logs = counterfactual_responsibility_suppression(
+        z_full, contributions, target, safe_kernel=1, normalization="event"
+    )
+    density_loss, density_logs = counterfactual_responsibility_suppression(
+        z_full, contributions, target, safe_kernel=1, normalization="safe_density"
+    )
+    pixel_loss, pixel_logs = counterfactual_responsibility_suppression(
+        z_full, contributions, target, safe_kernel=1, normalization="unique_pixel"
+    )
+
+    torch.testing.assert_close(event_loss, numerator / 3.0)
+    torch.testing.assert_close(density_loss, numerator / 2.0)
+    expected_pixel = (
+        (penalties[0, 0, 0, 0] + penalties[0, 1, 0, 0]) / 2.0
+        + penalties[0, 0, 0, 1]
+    ) / 2.0
+    torch.testing.assert_close(pixel_loss, expected_pixel)
+    assert event_logs["normalization_denominator"] == 3
+    assert density_logs["normalization_denominator"] == 2
+    assert pixel_logs["normalization_denominator"] == 2
+    assert event_logs["responsibility_mean_degree"] == 1.5
+
+
+def test_same_pixel_random_scale_preserves_pixels_degree_and_changes_scale() -> None:
+    z_full = torch.ones(1, 1, 1, 3)
+    contributions = torch.zeros(1, 4, 1, 3, requires_grad=True)
+    with torch.no_grad():
+        contributions[0, 0, 0, 0] = 2.0
+        contributions[0, 1, 0, 1] = 2.0
+    target = torch.zeros_like(z_full)
+
+    loss, logs = same_pixel_random_scale_suppression(
+        z_full, contributions, target, safe_kernel=1, salt=19
+    )
+    loss.backward()
+
+    true_mask = build_responsibility_mask(
+        z_full, contributions.detach(), build_safe_background(target, 1)
+    ).bool()
+    selected = contributions.grad != 0
+    assert int(true_mask.sum()) == int(selected.sum()) == 2
+    assert torch.equal(true_mask.any(dim=1), selected.any(dim=1))
+    assert torch.equal(true_mask.sum(dim=1), selected.sum(dim=1))
+    assert not bool((true_mask & selected).any())
+    assert logs["control_budget_match_ratio"] == 1
+    assert logs["control_pixel_match_ratio"] == 1
+    assert logs["control_shortage_count"] == 0
+    assert logs["control_contribution_gradient_l2_scale"] > 0
+    selected_raw_norm = logs["selected_contribution_gradient_l2_before_scale"]
+    reference_norm = logs["reference_contribution_gradient_l2"]
+    torch.testing.assert_close(
+        selected_raw_norm * logs["control_contribution_gradient_l2_scale"],
+        reference_norm,
+    )
+
+
+def test_magnitude_control_selects_nearest_nonpivotal_same_scale() -> None:
+    z_full = torch.tensor([[[[1.0, 1.2, 10.0]]]])
+    contributions = torch.zeros(1, 4, 1, 3, requires_grad=True)
+    with torch.no_grad():
+        contributions[0, 0, 0] = torch.tensor([2.0, 0.8, 8.0])
+    target = torch.zeros_like(z_full)
+
+    loss, logs = magnitude_matched_nonpivotal_suppression(
+        z_full, contributions, target, safe_kernel=1
+    )
+    loss.backward()
+
+    selected = contributions.grad != 0
+    assert selected[0, 0, 0, 1]
+    assert int(selected.sum()) == 1
+    assert z_full[0, 0, 0, 1] - contributions[0, 0, 0, 1] > 0
+    assert logs["responsible_count"] == 1
+    assert logs["control_selected_count"] == 1
+    assert logs["control_budget_match_ratio"] == 1
+    assert logs["control_shortage_count"] == 0
 
 
 def test_safe_background_validates_kernel() -> None:

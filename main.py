@@ -6,6 +6,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.data as Data
 from model.MSHNet import *
+from model.baselines.mshnet_deterministic import (
+    MSHNet as DeterministicBaselineMSHNet,
+)
+from model.baselines.mshnet_official import MSHNet as OfficialBaselineMSHNet
 from model.loss import *
 from model.full_dea_mshnet import FullDEAMSHNet
 from model.dea_integrated_mshnet import DEAIntegratedMSHNet
@@ -34,6 +38,9 @@ from model.scale_coalition_supervision import (
 )
 from model.counterfactual_responsibility import (
     counterfactual_responsibility_suppression,
+    matched_random_responsibility_suppression,
+    magnitude_matched_nonpivotal_suppression,
+    same_pixel_random_scale_suppression,
 )
 from model.task_gradient_supervision import (
     combine_task_and_auxiliary_gradients,
@@ -86,6 +93,9 @@ COALITION_DEEP_SUPERVISION_TYPES = (
 )
 RESPONSIBILITY_DEEP_SUPERVISION_TYPES = (
     'crs_flip_suppression',
+    'crs_matched_random',
+    'crs_same_pixel_random_scale',
+    'crs_magnitude_nonpivotal',
 )
 SCALE_SUBSET_DEEP_SUPERVISION = {
     'legacy_no_s3': (0, 1, 2),
@@ -278,6 +288,35 @@ def validate_args(args):
         raise ValueError("--crs-ramp-epochs must be >= 1.")
     if int(args.crs_safe_kernel) <= 0 or int(args.crs_safe_kernel) % 2 == 0:
         raise ValueError("--crs-safe-kernel must be a positive odd integer.")
+    if getattr(args, "sdrr_normalization", "event") not in (
+        "event",
+        "safe_density",
+        "unique_pixel",
+    ):
+        raise ValueError(
+            "--sdrr-normalization must be event, safe_density, or unique_pixel."
+        )
+    mshnet_variant = getattr(args, "mshnet_variant", "workbench")
+    if mshnet_variant not in ("workbench", "official", "deterministic"):
+        raise ValueError(
+            "--mshnet-variant must be workbench, official, or deterministic."
+        )
+    if args.model_type == "mshnet" and mshnet_variant != "workbench":
+        if any(
+            float(value) != 0.0
+            for value in (
+                args.dea_lambda_single,
+                args.dea_lambda_dec,
+                args.dea_lambda_empty,
+            )
+        ):
+            raise ValueError(
+                "clean MSHNet variants cannot expose the legacy DEA-lite head"
+            )
+        if is_homotopy_deep_supervision(args.deep_supervision):
+            raise ValueError(
+                "clean MSHNet variants do not expose legacy fusion_alpha"
+            )
     if int(getattr(args, "ownership_ignore_dilation", 3)) <= 0 or (
         int(getattr(args, "ownership_ignore_dilation", 3)) % 2 == 0
     ):
@@ -465,6 +504,9 @@ def get_method_name(args):
             "asfs_anchor_filtration": "ASFS-AnchorFiltration",
             "rdfs_continuation": "RDFS-Continuation",
             "crs_flip_suppression": "SDRR-ScaleDeletionResponsibility",
+            "crs_matched_random": "SDRR-ScaleBudgetRandomControl-Unmatched",
+            "crs_same_pixel_random_scale": "SDRR-SamePixelRandomScaleControl",
+            "crs_magnitude_nonpivotal": "SDRR-MagnitudeMatchedNonPivotalControl",
             "legacy_no_s3": "MSHNet-Control-NoS3",
             "legacy_no_s2s3": "MSHNet-Control-NoS2S3",
             "legacy_s0_only": "MSHNet-Control-S0Only",
@@ -473,6 +515,10 @@ def get_method_name(args):
             "mcsls_null_safe": "MSHNet-MC-SLS",
             "zmsls_null_abstain": "MSHNet-ZM-SLS-Abstain",
         }
+        if deep_supervision == "crs_flip_suppression":
+            normalization = getattr(args, "sdrr_normalization", "event")
+            if normalization != "event":
+                return "SDRR-NormalizationControl-" + normalization
         return names.get(deep_supervision, "MSHNet-" + deep_supervision)
     if is_cev_control(args.model_type):
         kernel = int(getattr(args, "cev_kernel_size", 7))
@@ -528,6 +574,11 @@ def get_method_name(args):
         return "DEA-lite"
     if getattr(args, "init_from_baseline", ""):
         return "MSHNet-Continued"
+    mshnet_variant = getattr(args, "mshnet_variant", "workbench")
+    if args.model_type == "mshnet" and mshnet_variant == "official":
+        return "MSHNet-OfficialForward"
+    if args.model_type == "mshnet" and mshnet_variant == "deterministic":
+        return "MSHNet-Deterministic"
     return "MSHNet"
 
 def get_run_folder_name(args, timestamp=None):
@@ -540,6 +591,7 @@ def get_method_metadata(args):
     return {
         "method": get_method_name(args),
         "model_type": args.model_type,
+        "mshnet_variant": getattr(args, "mshnet_variant", "workbench"),
         "cev_kernel_size": int(getattr(args, "cev_kernel_size", 7)),
         "cev_initial_bias": float(getattr(args, "cev_initial_bias", -6.0)),
         "cev_veto_strength": float(getattr(args, "cev_veto_strength", 1.0)),
@@ -611,6 +663,7 @@ def get_method_metadata(args):
         "crs_detach_scale_evidence": bool(
             getattr(args, "crs_detach_scale_evidence", False)
         ),
+        "sdrr_normalization": getattr(args, "sdrr_normalization", "event"),
         "predictive_state_channels": int(
             getattr(args, "predictive_state_channels", 32)
         ),
@@ -717,6 +770,15 @@ def parse_args():
         ],
     )
     parser.add_argument(
+        '--mshnet-variant',
+        choices=['workbench', 'official', 'deterministic'],
+        default='workbench',
+        help=(
+            'Physical MSHNet implementation: historical experiment workbench, '
+            'canonical official-forward, or parameter-identical deterministic-backward.'
+        ),
+    )
+    parser.add_argument(
         '--deep-supervision',
         type=str,
         default='legacy_exact',
@@ -740,6 +802,9 @@ def parse_args():
             'asfs_anchor_filtration',
             'rdfs_continuation',
             'crs_flip_suppression',
+            'crs_matched_random',
+            'crs_same_pixel_random_scale',
+            'crs_magnitude_nonpivotal',
             'legacy_no_s3',
             'legacy_no_s2s3',
             'legacy_s0_only',
@@ -779,6 +844,12 @@ def parse_args():
     parser.add_argument('--crs-start-epoch', type=int, default=250)
     parser.add_argument('--crs-ramp-epochs', type=int, default=50)
     parser.add_argument('--crs-safe-kernel', type=int, default=15)
+    parser.add_argument(
+        '--sdrr-normalization',
+        choices=['event', 'safe_density', 'unique_pixel'],
+        default='event',
+        help='Attribution control for SDRR gradient-budget normalization.',
+    )
     parser.add_argument(
         '--crs-detach-scale-evidence', type=str2bool, default=False,
         help=(
@@ -999,6 +1070,10 @@ class Trainer(object):
                 delta_min=args.predictive_delta_min,
                 legacy_influence_numerics=args.predictive_legacy_numerics,
             )
+        elif args.model_type == "mshnet" and args.mshnet_variant == "official":
+            model = OfficialBaselineMSHNet(3)
+        elif args.model_type == "mshnet" and args.mshnet_variant == "deterministic":
+            model = DeterministicBaselineMSHNet(3)
         else:
             model = MSHNet(3)
 
@@ -1235,8 +1310,12 @@ class Trainer(object):
             and not is_cev_control(self.args.model_type)
             and not (
                 self.args.model_type == 'mshnet'
-                and getattr(self.args, "deep_supervision", "legacy_exact")
-                != "legacy_exact"
+                and (
+                    getattr(self.args, "deep_supervision", "legacy_exact")
+                    != "legacy_exact"
+                    or getattr(self.args, "mshnet_variant", "workbench")
+                    != "workbench"
+                )
             )
         ):
             return
@@ -1347,6 +1426,7 @@ class Trainer(object):
                 'crs_ramp_epochs',
                 'crs_safe_kernel',
                 'crs_detach_scale_evidence',
+                'sdrr_normalization',
                 'test_split_sha256',
             )
         elif (
@@ -1411,6 +1491,11 @@ class Trainer(object):
                 'empty_side_policy',
                 'test_split_sha256',
             )
+        if (
+            self.args.model_type == 'mshnet'
+            and getattr(self.args, "mshnet_variant", "workbench") != "workbench"
+        ):
+            semantic_keys = ('mshnet_variant',) + semantic_keys
         if check_split_hashes:
             semantic_keys = semantic_keys + (
                 'train_split_sha256',
@@ -1420,6 +1505,13 @@ class Trainer(object):
         mismatches = []
         for key in semantic_keys:
             if key not in metadata:
+                if (
+                    key == 'sdrr_normalization'
+                    and expected[key] == 'event'
+                ):
+                    # Backward-compatible semantics for formal checkpoints
+                    # created before the normalization control was named.
+                    continue
                 mismatches.append('%s=<missing>' % key)
             elif metadata[key] != expected[key]:
                 mismatches.append(
@@ -2099,21 +2191,71 @@ class Trainer(object):
                 pred,
                 base_model.final,
             )
-            responsibility_loss, responsibility_log = (
-                counterfactual_responsibility_suppression(
-                    pred,
-                    coalition["contributions"],
-                    labels,
-                    safe_kernel=int(self.args.crs_safe_kernel),
+            if mode in (
+                "crs_matched_random",
+                "crs_same_pixel_random_scale",
+                "crs_magnitude_nonpivotal",
+            ):
+                control_salt = (
+                    int(getattr(self.args, "seed", 0)) * 1_000_003
+                    + int(epoch) * 9_176
+                    + int(getattr(self, "current_batch_index", 0))
                 )
-            )
+                control_function = (
+                    matched_random_responsibility_suppression
+                    if mode == "crs_matched_random"
+                    else (
+                        same_pixel_random_scale_suppression
+                        if mode == "crs_same_pixel_random_scale"
+                        else magnitude_matched_nonpivotal_suppression
+                    )
+                )
+                responsibility_loss, responsibility_log = (
+                    control_function(
+                        pred,
+                        coalition["contributions"],
+                        labels,
+                        safe_kernel=int(self.args.crs_safe_kernel),
+                        normalization=getattr(
+                            self.args, "sdrr_normalization", "event"
+                        ),
+                        **(
+                            {}
+                            if mode == "crs_magnitude_nonpivotal"
+                            else {"salt": control_salt}
+                        ),
+                    )
+                )
+            else:
+                responsibility_loss, responsibility_log = (
+                    counterfactual_responsibility_suppression(
+                        pred,
+                        coalition["contributions"],
+                        labels,
+                        safe_kernel=int(self.args.crs_safe_kernel),
+                        normalization=getattr(
+                            self.args, "sdrr_normalization", "event"
+                        ),
+                    )
+                )
             weighted = float(self.args.crs_lambda) * ramp * responsibility_loss
             self.last_deep_supervision_log.update({
                 "canonical_loss": canonical_total.detach(),
                 "crs_loss_raw": responsibility_loss.detach(),
                 "crs_loss_weighted": weighted.detach(),
                 "crs_ramp": ramp,
-                "counterfactual_responsibility": 1.0,
+                "counterfactual_responsibility": float(
+                    mode == "crs_flip_suppression"
+                ),
+                "scale_budget_random_control": float(
+                    mode == "crs_matched_random"
+                ),
+                "same_pixel_random_scale_control": float(
+                    mode == "crs_same_pixel_random_scale"
+                ),
+                "magnitude_matched_nonpivotal_control": float(
+                    mode == "crs_magnitude_nonpivotal"
+                ),
                 "crs_detach_scale_evidence": float(
                     bool(self.args.crs_detach_scale_evidence)
                 ),
@@ -2595,6 +2737,7 @@ class Trainer(object):
         tbar = tqdm(self.train_loader)
         losses = AverageMeter()
         for i, batch in enumerate(tbar):
+            self.current_batch_index = i
             data, mask, instance_map = self.unpack_batch(batch)
   
             data = data.to(self.device, non_blocking=True)
@@ -2654,11 +2797,17 @@ class Trainer(object):
                     )
                     else None
                 )
-                masks, pred = self.model(
-                    data,
-                    tag,
-                    fusion_alpha=fusion_alpha,
-                )
+                if fusion_alpha is None:
+                    # Preserve the physically isolated canonical MSHNet
+                    # two-argument interface.  Experimental workbench-only
+                    # keywords must not leak into baseline/SDRR forwards.
+                    masks, pred = self.model(data, tag)
+                else:
+                    masks, pred = self.model(
+                        data,
+                        tag,
+                        fusion_alpha=fusion_alpha,
+                    )
                 dea_out = None
 
             if cev_out is not None:

@@ -168,6 +168,14 @@ IoU 1.60 percentage points，也提高平均 PD、降低平均 FA，并显著降
 事件驱动，而非持续重加权所有像素。不过 seed 20260712 的强增益不能仅由最终责任
 事件消除解释，仍需 matched sparse/random-event control 排除优化扰动效应。
 
+该对照现已实现为 `crs_matched_random`，但尚未产生性能结果。它在每个
+image×scale 上先计算真实删除翻转事件数，再从同一安全背景正决策域内的非责任正
+贡献中，以不消耗训练 RNG 的无状态伪随机排序抽取相同数量；惩罚函数、归一化、
+权重和调度与 SDRR 完全相同。没有真实事件时，对照损失及梯度严格为零。该设计匹配
+“何时激活、每尺度多少事件、梯度形式和预算”，只替换事件身份，因此可用于检验收益
+是否来自删除翻转归责本身。当前只能说对照 mechanics 通过测试，不能提前声称 SDRR
+已胜过该对照。
+
 概率阈值 0.3–0.7 的均值曲线中，SDRR 的 IoU 均高于 baseline；在默认 0.5
 阈值处为 0.7344 vs 0.7186，PD 为 0.9691 vs 0.9568，FA/M 为 6.03 vs 7.10。
 因此正式增益不是只由默认阈值校准造成。
@@ -185,13 +193,16 @@ IoU 1.60 percentage points，也提高平均 PD、降低平均 FA，并显著降
 
 ### 下一道 GO gate
 
-1. 在 NUDT-SIRST 的独立 train holdout 上先做同 seed 配对；方向不退化才补齐三种子。
-2. 冻结 `start=50/ramp=10/lambda=0.05/kernel=15`，不再使用 NUAA holdout 调参。
-3. 至少在两个数据集达到正的三种子配对 IoU 均值，且报告 PD/FA 全部结果。
-4. 若跨数据集只提升 IoU 而持续恶化 FA，则该候选只能作为分析分支，不能宣布成功。
-5. 最终模型冻结后才允许读取 official test manifest。
+1. 完成 NUDT-SIRST 的严格 400-epoch 三种子配对，不根据中途结果改参。
+2. 正式配置冻结为 `start=250/ramp=50/lambda=0.05/kernel=15`；早期
+   `start=50/ramp=10` 只属于 80-epoch 筛选协议。
+3. 至少在两个数据集达到正的三种子配对 IoU 均值，并完整报告 PD/FA 与负种子。
+4. 在 NUAA 正式设置运行 matched sparse/random-event control；若随机对照复现同等
+   增益，则必须削弱或否定“删除翻转身份关键”的机制主张。
+5. 若跨数据集只提升 IoU 而持续恶化 FA，则该候选只能作为分析分支，不能宣布成功。
+6. 最终模型和机制表述通过上述 gate 后才允许读取 official test manifest。
 
-本轮完整测试：`187 passed`。
+本轮完整测试：`192 passed`。
 
 ---
 

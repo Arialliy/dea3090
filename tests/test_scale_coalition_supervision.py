@@ -8,6 +8,7 @@ from model.MSHNet import MSHNet
 from model.loss import SLSIoULoss
 from model.scale_coalition_supervision import (
     assemble_mshnet_scale_logits,
+    direct_zero_channel_coalitions,
     leave_one_scale_out_coalitions,
     nested_scale_filtration,
 )
@@ -75,6 +76,22 @@ def test_helper_adds_no_trainable_parameters() -> None:
     leave_one_scale_out_coalitions(masks, z_full, fusion)
 
     assert tuple(fusion.parameters()) == before
+
+
+def test_direct_zero_channel_audit_matches_native_manual_deletion() -> None:
+    masks = make_masks()
+    fusion = nn.Conv2d(4, 1, kernel_size=3, padding=1)
+    scale_logits = assemble_mshnet_scale_logits(masks)
+
+    direct = direct_zero_channel_coalitions(scale_logits, fusion)
+
+    assert direct.shape == (2, 4, 16, 16)
+    for scale in range(4):
+        retained = scale_logits.clone()
+        retained[:, scale] = 0.0
+        torch.testing.assert_close(
+            direct[:, scale : scale + 1], fusion(retained), rtol=0.0, atol=0.0
+        )
 
 
 def test_filtration_states_are_exact_nested_native_fusions() -> None:

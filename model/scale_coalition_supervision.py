@@ -87,6 +87,32 @@ def leave_one_scale_out_coalitions(
     }
 
 
+def direct_zero_channel_coalitions(
+    scale_logits: Tensor,
+    fusion: nn.Conv2d,
+) -> Tensor:
+    """Audit-only deletion by actually zeroing each fusion input channel.
+
+    Unlike the algebraic ``z_full - contribution_i`` path used for efficient
+    training, this function invokes the native final convolution four times.
+    It is intentionally kept out of the training objective and exists to
+    quantify floating-point event-mask sensitivity at the decision boundary.
+    """
+
+    if scale_logits.ndim != 4 or scale_logits.shape[1] != 4:
+        raise ValueError("scale_logits must have shape [B,4,H,W]")
+    if not isinstance(fusion, nn.Conv2d):
+        raise TypeError("fusion must be torch.nn.Conv2d")
+    if fusion.in_channels != 4 or fusion.out_channels != 1:
+        raise ValueError("fusion must map four scale channels to one logit")
+    outputs = []
+    for scale in range(4):
+        retained = scale_logits.clone()
+        retained[:, scale] = 0.0
+        outputs.append(fusion(retained))
+    return torch.cat(outputs, dim=1)
+
+
 def nested_scale_filtration(
     masks: Sequence[Tensor],
     z_full: Tensor,
@@ -118,6 +144,7 @@ def nested_scale_filtration(
 
 __all__ = [
     "assemble_mshnet_scale_logits",
+    "direct_zero_channel_coalitions",
     "leave_one_scale_out_coalitions",
     "nested_scale_filtration",
 ]
