@@ -4,12 +4,14 @@ import os
 import sys
 
 import torch
+import torch.nn.functional as F
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
 from model.task_consistent_supervision import (  # noqa: E402
+    REASON_DISAPPEARED,
     REASON_LOW_IOU,
     REASON_MERGED,
     TaskConsistentAssignment,
@@ -96,3 +98,29 @@ def test_component_id_permutation_does_not_change_feasibility_geometry() -> None
         assignment_a.feasible[0].sort(dim=0).values,
         assignment_b.feasible[0].sort(dim=0).values,
     )
+
+
+def test_direct_stride_projection_matches_repeated_pooling_on_valid_shape() -> None:
+    torch.manual_seed(19)
+    mask = torch.rand((32, 32)) > 0.9
+
+    direct = TaskConsistentProjectionGraph._project_and_lift(mask, stride=8)
+    pooled = mask.float().view(1, 1, 32, 32)
+    for _ in range(3):
+        pooled = F.max_pool2d(pooled, kernel_size=2, stride=2)
+    repeated = F.interpolate(pooled, size=mask.shape, mode="nearest")[0, 0] > 0.5
+
+    assert torch.equal(direct, repeated)
+
+
+def test_border_target_is_not_dropped_on_supported_divisible_shape() -> None:
+    instance_map = torch.zeros((1, 32, 32), dtype=torch.long)
+    instance_map[0, 30:32, 30:32] = 1
+    graph = TaskConsistentProjectionGraph(strides=(1, 2, 4, 8), min_iou=0.0)
+
+    assignment = graph(instance_map)
+
+    assert torch.isfinite(assignment.centroid_distance[0][0]).all()
+    assert not bool(
+        (assignment.reason_code[0][0] == REASON_DISAPPEARED).any()
+    ), "supported border target must not disappear through pooling floor"

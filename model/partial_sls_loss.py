@@ -22,13 +22,16 @@ class PartialSLSIoULoss(nn.Module):
         warm_epoch: int,
         epoch: int,
         with_shape: bool = True,
+        reduction: str = "mean",
     ) -> torch.Tensor:
         if pred_log.shape != target.shape or target.shape != valid.shape:
             raise ValueError("pred_log, target, and valid shapes must match")
+        if reduction not in {"none", "mean"}:
+            raise ValueError("reduction must be 'none' or 'mean'")
 
         # This branch is intentional: it makes the required baseline identity
         # bitwise exact instead of merely algebraically close.
-        if bool(torch.all(valid == 1).detach().cpu()):
+        if reduction == "mean" and bool(torch.all(valid == 1).detach().cpu()):
             return self.canonical(
                 pred_log,
                 target,
@@ -42,35 +45,45 @@ class PartialSLSIoULoss(nn.Module):
         valid = valid.to(dtype=pred.dtype)
         pred_valid = pred * valid
         target_valid = target * valid
+        sample_all_valid = (valid == 1).flatten(1).all(dim=1)
 
         intersection_sum = (pred * target * valid).sum(dim=(1, 2, 3))
         pred_sum = pred_valid.sum(dim=(1, 2, 3))
         target_sum = target_valid.sum(dim=(1, 2, 3))
         distance = ((pred_sum - target_sum) / 2.0).square()
-        alpha = (torch.minimum(pred_sum, target_sum) + distance) / (
-            torch.maximum(pred_sum, target_sum) + distance + self.eps
+        partial_eps = torch.where(
+            sample_all_valid,
+            torch.zeros_like(pred_sum),
+            torch.full_like(pred_sum, self.eps),
         )
-        iou = (intersection_sum + self.eps) / (
-            pred_sum + target_sum - intersection_sum + self.eps
+        alpha = (torch.minimum(pred_sum, target_sum) + distance) / (
+            torch.maximum(pred_sum, target_sum) + distance + partial_eps
+        )
+        iou = (intersection_sum + partial_eps) / (
+            pred_sum + target_sum - intersection_sum + partial_eps
         )
         has_positive = target_sum > 0
         iou = torch.where(has_positive, iou, torch.zeros_like(iou))
 
         if epoch <= warm_epoch:
-            return 1.0 - iou.mean()
+            return self._reduce(1.0 - iou, reduction)
         scaled_iou = torch.where(
             has_positive,
             alpha * iou,
             torch.zeros_like(iou),
         )
-        loss = 1.0 - scaled_iou.mean()
+        loss_per_sample = 1.0 - scaled_iou
         if with_shape:
-            loss = loss + self._partial_location_loss(
+            loss_per_sample = loss_per_sample + self._partial_location_loss(
                 pred_valid,
                 target_valid,
                 valid,
             )
-        return loss
+        return self._reduce(loss_per_sample, reduction)
+
+    @staticmethod
+    def _reduce(loss: torch.Tensor, reduction: str) -> torch.Tensor:
+        return loss if reduction == "none" else loss.mean()
 
     @staticmethod
     def _partial_location_loss(
@@ -110,13 +123,14 @@ class PartialSLSIoULoss(nn.Module):
         )
         terms = 1.0 - length_ratio + angle
 
-        # Partial labels with no known positive have meaningful background
-        # scale supervision but no target location.  The all-valid case was
-        # already delegated to the canonical loss above.
+        # Partial labels with no known positive have no target location.  An
+        # all-valid sample preserves canonical SLS numerics even when it is an
+        # empty crop; this is required for mixed-batch baseline identity.
         has_positive = target.flatten(1).sum(dim=1) > 0
         has_known_pixel = valid.flatten(1).sum(dim=1) > 0
-        active = has_positive & has_known_pixel
-        return torch.where(active, terms, torch.zeros_like(terms)).mean()
+        sample_all_valid = (valid == 1).flatten(1).all(dim=1)
+        active = (has_positive & has_known_pixel) | sample_all_valid
+        return torch.where(active, terms, torch.zeros_like(terms))
 
 
 __all__ = ["PartialSLSIoULoss"]

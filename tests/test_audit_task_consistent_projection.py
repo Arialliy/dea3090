@@ -36,3 +36,4 @@ def test_projection_audit_reports_identity_and_coarse_loss(tmp_path: Path) -> No
     assert report["per_stride"][0]["feasible_ratio"] == 1.0
     assert report["per_stride"][1]["feasible_ratio"] == 0.0
     assert report["per_stride"][1]["reason_counts"]["low_iou"] == 1
+    assert report["nestedness"][0]["violation_count"] == 0

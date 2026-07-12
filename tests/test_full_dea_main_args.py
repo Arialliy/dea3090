@@ -16,6 +16,7 @@ from main import Trainer, get_method_metadata, get_method_name, get_run_folder_n
 from model.MSHNet import MSHNet
 from model.dea_mshnet import DEAMSHNet
 from model.full_dea_mshnet import FullDEAMSHNet
+from model.loss import SLSIoULoss
 
 
 def make_args(**kwargs):
@@ -61,6 +62,8 @@ def make_args(**kwargs):
         dataset_dir="datasets/NUAA-SIRST",
         seed=20260706,
         deterministic=True,
+        s3_start_epoch=20,
+        hms_ramp_epochs=20,
     )
     for key, value in kwargs.items():
         setattr(args, key, value)
@@ -167,6 +170,194 @@ def test_tfds_projection_rejects_invalid_task_thresholds() -> None:
             deep_supervision="tfds_projection",
             tfds_min_iou=1.1,
         ))
+
+
+def test_tfds_active_renorm_is_explicitly_named_as_diagnostic() -> None:
+    args = validate_args(make_args(
+        deep_supervision="tfds_projection_active_renorm",
+    ))
+
+    assert get_method_name(args) == "TCDS-Projection-ActiveRenorm"
+    assert args.return_instance_map is True
+
+
+def test_tgds_halfspace_is_parameter_free_deep_supervision() -> None:
+    args = validate_args(make_args(deep_supervision="tgds_halfspace"))
+
+    assert get_method_name(args) == "TGDS-Halfspace"
+    assert args.return_instance_map is False
+    metadata = get_method_metadata(args)
+    assert metadata["deep_supervision"] == "tgds_halfspace"
+
+
+def test_tsds_lift_is_parameter_free_and_needs_no_instance_map() -> None:
+    args = validate_args(make_args(deep_supervision="tsds_lift"))
+
+    assert get_method_name(args) == "TSDS-Lift"
+    assert args.return_instance_map is False
+    assert get_method_metadata(args)["deep_supervision"] == "tsds_lift"
+
+
+def test_prds_regret_is_parameter_free_and_needs_no_instance_map() -> None:
+    args = validate_args(make_args(deep_supervision="prds_regret"))
+
+    assert get_method_name(args) == "PRDS-Regret"
+    assert args.return_instance_map is False
+    assert get_method_metadata(args)["deep_supervision"] == "prds_regret"
+
+
+def test_cscs_is_parameter_free_and_needs_no_instance_map() -> None:
+    args = validate_args(make_args(deep_supervision="cscs_leave_one_out"))
+
+    assert get_method_name(args) == "CSCS-LeaveOneOut"
+    assert args.return_instance_map is False
+    assert get_method_metadata(args)["deep_supervision"] == (
+        "cscs_leave_one_out"
+    )
+
+
+def test_sfds_is_parameter_free_and_needs_no_instance_map() -> None:
+    args = validate_args(make_args(deep_supervision="sfds_filtration"))
+
+    assert get_method_name(args) == "SFDS-Filtration"
+    assert args.return_instance_map is False
+    assert get_method_metadata(args)["deep_supervision"] == "sfds_filtration"
+
+
+def test_asfs_is_parameter_free_and_needs_no_instance_map() -> None:
+    args = validate_args(make_args(deep_supervision="asfs_anchor_filtration"))
+
+    assert get_method_name(args) == "ASFS-AnchorFiltration"
+    assert args.return_instance_map is False
+    assert get_method_metadata(args)["deep_supervision"] == (
+        "asfs_anchor_filtration"
+    )
+
+
+def test_rdfs_persists_role_discovery_schedule() -> None:
+    args = validate_args(make_args(
+        deep_supervision="rdfs_continuation",
+        rdfs_start_epoch=20,
+        rdfs_ramp_epochs=15,
+    ))
+
+    assert get_method_name(args) == "RDFS-Continuation"
+    metadata = get_method_metadata(args)
+    assert metadata["rdfs_start_epoch"] == 20
+    assert metadata["rdfs_ramp_epochs"] == 15
+
+    with pytest.raises(ValueError, match="rdfs-start-epoch"):
+        validate_args(make_args(
+            deep_supervision="rdfs_continuation",
+            rdfs_start_epoch=-1,
+        ))
+    with pytest.raises(ValueError, match="rdfs-ramp-epochs"):
+        validate_args(make_args(
+            deep_supervision="rdfs_continuation",
+            rdfs_ramp_epochs=0,
+        ))
+
+
+def test_crs_persists_counterfactual_constraint_semantics() -> None:
+    args = validate_args(make_args(
+        deep_supervision="crs_flip_suppression",
+        crs_lambda=0.05,
+        crs_start_epoch=20,
+        crs_ramp_epochs=10,
+        crs_safe_kernel=15,
+        crs_detach_scale_evidence=True,
+    ))
+
+    assert get_method_name(args) == "SDRR-ScaleDeletionResponsibility"
+    assert args.return_instance_map is False
+    metadata = get_method_metadata(args)
+    assert metadata["crs_lambda"] == 0.05
+    assert metadata["crs_start_epoch"] == 20
+    assert metadata["crs_ramp_epochs"] == 10
+    assert metadata["crs_safe_kernel"] == 15
+    assert metadata["crs_detach_scale_evidence"] is True
+
+    with pytest.raises(ValueError, match="crs-safe-kernel"):
+        validate_args(make_args(
+            deep_supervision="crs_flip_suppression",
+            crs_safe_kernel=8,
+        ))
+
+
+@pytest.mark.parametrize(
+    ("mode", "name"),
+    [
+        ("legacy_no_s3", "MSHNet-Control-NoS3"),
+        ("legacy_no_s2s3", "MSHNet-Control-NoS2S3"),
+        ("legacy_s0_only", "MSHNet-Control-S0Only"),
+    ],
+)
+def test_scale_subset_controls_are_explicit(mode: str, name: str) -> None:
+    args = validate_args(make_args(deep_supervision=mode))
+    assert get_method_name(args) == name
+    assert args.return_instance_map is False
+
+
+def test_scale_subset_warmup_without_side_logits_degenerates_to_final() -> None:
+    trainer = Trainer.__new__(Trainer)
+    trainer.args = make_args(deep_supervision="legacy_no_s3")
+    trainer.loss_fun = SLSIoULoss()
+    trainer.warm_epoch = 5
+    trainer.down = nn.MaxPool2d(2, 2)
+    trainer.last_deep_supervision_log = {}
+    trainer.last_tgds_components = None
+    prediction = torch.zeros(2, 1, 8, 8, requires_grad=True)
+    labels = torch.zeros_like(prediction)
+
+    actual = trainer.compute_deep_supervision_loss(
+        prediction,
+        [],
+        labels,
+        instance_map=None,
+        epoch=0,
+    )
+    expected = trainer.loss_fun(prediction, labels, trainer.warm_epoch, 0)
+    torch.testing.assert_close(actual, expected)
+
+
+def test_s3_delayed_control_is_explicit_and_validates_start_epoch() -> None:
+    args = validate_args(make_args(
+        deep_supervision="legacy_s3_delayed",
+        s3_start_epoch=20,
+    ))
+    assert get_method_name(args) == "MSHNet-Control-S3Delayed"
+    assert get_method_metadata(args)["s3_start_epoch"] == 20
+    with pytest.raises(ValueError, match="s3-start-epoch"):
+        validate_args(make_args(
+            deep_supervision="legacy_s3_delayed",
+            s3_start_epoch=-1,
+        ))
+
+
+def test_hms_continuation_is_parameter_free_and_validates_ramp() -> None:
+    args = validate_args(make_args(
+        deep_supervision="hms_continuation",
+        hms_ramp_epochs=20,
+    ))
+    assert get_method_name(args) == "MSHNet-HMS-Continuation"
+    assert get_method_metadata(args)["hms_ramp_epochs"] == 20
+    with pytest.raises(ValueError, match="hms-ramp-epochs"):
+        validate_args(make_args(
+            deep_supervision="hms_continuation",
+            hms_ramp_epochs=0,
+        ))
+
+
+def test_mcsls_is_parameter_free_and_needs_no_instance_map() -> None:
+    args = validate_args(make_args(deep_supervision="mcsls_null_safe"))
+    assert get_method_name(args) == "MSHNet-MC-SLS"
+    assert args.return_instance_map is False
+
+
+def test_zmsls_abstention_is_explicit_and_parameter_free() -> None:
+    args = validate_args(make_args(deep_supervision="zmsls_null_abstain"))
+    assert get_method_name(args) == "MSHNet-ZM-SLS-Abstain"
+    assert args.return_instance_map is False
 
 
 def test_rods_checkpoint_metadata_rejects_ownership_mismatch() -> None:

@@ -13,7 +13,12 @@ class ChannelAttention(nn.Module):
         self.sigmoid = nn.Sigmoid()
     def forward(self, x):
         avg_out = self.fc2(self.relu1(self.fc1(self.avg_pool(x))))
-        max_out = self.fc2(self.relu1(self.fc1(self.max_pool(x))))
+        # ``AdaptiveMaxPool2d(1)`` has no deterministic CUDA backward in
+        # PyTorch 2.9.  Reduction by ``amax`` is forward-equivalent here and
+        # lets strict deterministic training fail closed instead of silently
+        # producing seed trajectories that cannot be reproduced.
+        spatial_max = torch.amax(x, dim=(-2, -1), keepdim=True)
+        max_out = self.fc2(self.relu1(self.fc1(spatial_max)))
         out = avg_out + max_out
         return self.sigmoid(out)
 
@@ -160,7 +165,14 @@ class MSHNet(nn.Module):
             "decidability_logit": d_logit,
         }
 
-    def forward(self, x, warm_flag, return_dea=False, dea_detach_evidence=False):
+    def forward(
+        self,
+        x,
+        warm_flag,
+        return_dea=False,
+        dea_detach_evidence=False,
+        fusion_alpha=None,
+    ):
         x_e0 = self.encoder_0(self.conv_init(x))
         x_e1 = self.encoder_1(self.pool(x_e0))
         x_e2 = self.encoder_2(self.pool(x_e1))
@@ -187,6 +199,11 @@ class MSHNet(nn.Module):
 
             scale_logits = torch.cat([s0, s1, s2, s3], dim=1)
             z_full = self.final(scale_logits)
+            if fusion_alpha is not None:
+                alpha = float(fusion_alpha)
+                if not 0.0 <= alpha <= 1.0:
+                    raise ValueError("fusion_alpha must be in [0, 1]")
+                z_full = (1.0 - alpha) * mask0 + alpha * z_full
 
             if return_dea:
                 dea_out = self.build_dea_lite_outputs(

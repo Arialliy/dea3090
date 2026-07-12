@@ -85,6 +85,7 @@ def audit_dataset(args: argparse.Namespace) -> dict[str, Any]:
         {name: 0 for name in REASON_NAMES.values()}
         for _ in strides
     ]
+    nestedness_violations = [0 for _ in range(max(0, len(strides) - 1))]
     for name in names:
         instance_map = load_instance_map(dataset_dir / "masks" / f"{name}.png")
         assignment = graph_builder(instance_map.unsqueeze(0))
@@ -96,6 +97,13 @@ def audit_dataset(args: argparse.Namespace) -> dict[str, Any]:
         score = assignment.recovery_iou[0]
         distance = assignment.centroid_distance[0]
         reason = assignment.reason_code[0]
+        for pair_index in range(len(strides) - 1):
+            nestedness_violations[pair_index] += int(
+                (
+                    feasible[:, pair_index + 1]
+                    & ~feasible[:, pair_index]
+                ).sum().item()
+            )
         for side_index in range(len(strides)):
             feasible_counts[side_index] += int(feasible[:, side_index].sum().item())
             iou_values[side_index].extend(score[:, side_index].tolist())
@@ -128,6 +136,20 @@ def audit_dataset(args: argparse.Namespace) -> dict[str, Any]:
             }
         )
 
+    nestedness = []
+    for pair_index in range(len(strides) - 1):
+        coarse_count = feasible_counts[pair_index + 1]
+        nestedness.append(
+            {
+                "fine_stride": strides[pair_index],
+                "coarse_stride": strides[pair_index + 1],
+                "violation_count": nestedness_violations[pair_index],
+                "violation_ratio_among_coarse_feasible": (
+                    nestedness_violations[pair_index] / max(1, coarse_count)
+                ),
+            }
+        )
+
     return {
         "schema_version": 1,
         "method": "task_consistent_projection_audit",
@@ -143,6 +165,7 @@ def audit_dataset(args: argparse.Namespace) -> dict[str, Any]:
         "min_iou": float(args.min_iou),
         "max_centroid_distance": float(args.max_centroid_distance),
         "per_stride": per_stride,
+        "nestedness": nestedness,
     }
 
 
@@ -172,6 +195,24 @@ def build_markdown(report: dict[str, Any]) -> str:
                 split=reasons["split"],
                 low=reasons["low_iou"],
                 loc=reasons["localization"],
+            )
+        )
+    lines.append("")
+    lines.extend(
+        [
+            "## Graph nestedness",
+            "",
+            "| Fine stride | Coarse stride | Violations | Ratio among coarse-feasible |",
+            "|---:|---:|---:|---:|",
+        ]
+    )
+    for row in report["nestedness"]:
+        lines.append(
+            "| {fine} | {coarse} | {count} | {ratio:.4f} |".format(
+                fine=row["fine_stride"],
+                coarse=row["coarse_stride"],
+                count=row["violation_count"],
+                ratio=row["violation_ratio_among_coarse_feasible"],
             )
         )
     lines.append("")

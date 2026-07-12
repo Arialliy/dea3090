@@ -27,6 +27,19 @@ from model.resolution_owned_supervision import (
     ResolutionDecidableSupervisionGraph,
 )
 from model.partial_sls_loss import PartialSLSIoULoss
+from model.measure_conditioned_sls import MeasureConditionedSLSIoULoss
+from model.scale_coalition_supervision import (
+    leave_one_scale_out_coalitions,
+    nested_scale_filtration,
+)
+from model.counterfactual_responsibility import (
+    counterfactual_responsibility_suppression,
+)
+from model.task_gradient_supervision import (
+    combine_task_and_auxiliary_gradients,
+    gradient_inner_product,
+    project_auxiliary_gradient,
+)
 from model.task_consistent_supervision import (
     TaskConsistentPartialTargetBuilder,
     TaskConsistentProjectionGraph,
@@ -52,7 +65,43 @@ RODS_DEEP_SUPERVISION_TYPES = (
     'rods_random',
     'rods_area_only',
 )
-TFDS_DEEP_SUPERVISION_TYPES = ('tfds_projection',)
+TFDS_DEEP_SUPERVISION_TYPES = (
+    'tfds_projection',
+    'tfds_projection_active_renorm',
+)
+TGDS_DEEP_SUPERVISION_TYPES = (
+    'tgds_halfspace',
+)
+TSDS_DEEP_SUPERVISION_TYPES = (
+    'tsds_lift',
+)
+PRDS_DEEP_SUPERVISION_TYPES = (
+    'prds_regret',
+)
+COALITION_DEEP_SUPERVISION_TYPES = (
+    'cscs_leave_one_out',
+    'sfds_filtration',
+    'asfs_anchor_filtration',
+    'rdfs_continuation',
+)
+RESPONSIBILITY_DEEP_SUPERVISION_TYPES = (
+    'crs_flip_suppression',
+)
+SCALE_SUBSET_DEEP_SUPERVISION = {
+    'legacy_no_s3': (0, 1, 2),
+    'legacy_no_s2s3': (0, 1),
+    'legacy_s0_only': (0,),
+}
+SCHEDULED_DEEP_SUPERVISION_TYPES = (
+    'legacy_s3_delayed',
+)
+HOMOTOPY_DEEP_SUPERVISION_TYPES = (
+    'hms_continuation',
+)
+MEASURE_CONDITIONED_DEEP_SUPERVISION_TYPES = (
+    'mcsls_null_safe',
+    'zmsls_null_abstain',
+)
 
 
 def is_dea_main_model(model_type):
@@ -66,6 +115,33 @@ def is_rods_deep_supervision(deep_supervision):
 
 def is_tfds_deep_supervision(deep_supervision):
     return deep_supervision in TFDS_DEEP_SUPERVISION_TYPES
+
+def is_tgds_deep_supervision(deep_supervision):
+    return deep_supervision in TGDS_DEEP_SUPERVISION_TYPES
+
+def is_tsds_deep_supervision(deep_supervision):
+    return deep_supervision in TSDS_DEEP_SUPERVISION_TYPES
+
+def is_prds_deep_supervision(deep_supervision):
+    return deep_supervision in PRDS_DEEP_SUPERVISION_TYPES
+
+def is_coalition_deep_supervision(deep_supervision):
+    return deep_supervision in COALITION_DEEP_SUPERVISION_TYPES
+
+def is_responsibility_deep_supervision(deep_supervision):
+    return deep_supervision in RESPONSIBILITY_DEEP_SUPERVISION_TYPES
+
+def is_scale_subset_deep_supervision(deep_supervision):
+    return deep_supervision in SCALE_SUBSET_DEEP_SUPERVISION
+
+def is_scheduled_deep_supervision(deep_supervision):
+    return deep_supervision in SCHEDULED_DEEP_SUPERVISION_TYPES
+
+def is_homotopy_deep_supervision(deep_supervision):
+    return deep_supervision in HOMOTOPY_DEEP_SUPERVISION_TYPES
+
+def is_measure_conditioned_deep_supervision(deep_supervision):
+    return deep_supervision in MEASURE_CONDITIONED_DEEP_SUPERVISION_TYPES
 
 def str2bool(value):
     if isinstance(value, bool):
@@ -98,9 +174,12 @@ def seed_everything(seed, deterministic=False):
     os.environ["PYTHONHASHSEED"] = str(seed)
 
     if deterministic:
+        os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+        torch.use_deterministic_algorithms(True)
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
     else:
+        torch.use_deterministic_algorithms(False)
         torch.backends.cudnn.deterministic = False
         torch.backends.cudnn.benchmark = True
 
@@ -121,7 +200,7 @@ def validate_args(args):
         "legacy_rescaled",
         "final_only",
         "side_no_location",
-    ) + RODS_DEEP_SUPERVISION_TYPES + TFDS_DEEP_SUPERVISION_TYPES
+    ) + RODS_DEEP_SUPERVISION_TYPES + TFDS_DEEP_SUPERVISION_TYPES + TGDS_DEEP_SUPERVISION_TYPES + TSDS_DEEP_SUPERVISION_TYPES + PRDS_DEEP_SUPERVISION_TYPES + COALITION_DEEP_SUPERVISION_TYPES + RESPONSIBILITY_DEEP_SUPERVISION_TYPES + tuple(SCALE_SUBSET_DEEP_SUPERVISION) + SCHEDULED_DEEP_SUPERVISION_TYPES + HOMOTOPY_DEEP_SUPERVISION_TYPES + MEASURE_CONDITIONED_DEEP_SUPERVISION_TYPES
     if args.deep_supervision not in deep_supervision_choices:
         raise ValueError("--deep-supervision has an unsupported value.")
     defaults = {
@@ -136,6 +215,15 @@ def validate_args(args):
         "rods_log_interval": 50,
         "tfds_min_iou": 0.5,
         "tfds_max_centroid_distance": 3.0,
+        "s3_start_epoch": 20,
+        "hms_ramp_epochs": 20,
+        "rdfs_start_epoch": 20,
+        "rdfs_ramp_epochs": 20,
+        "crs_lambda": 0.05,
+        "crs_start_epoch": 250,
+        "crs_ramp_epochs": 50,
+        "crs_safe_kernel": 15,
+        "crs_detach_scale_evidence": False,
     }
     for key, value in defaults.items():
         if not hasattr(args, key):
@@ -174,6 +262,22 @@ def validate_args(args):
         raise ValueError("--tfds-min-iou must be in [0, 1].")
     if float(args.tfds_max_centroid_distance) <= 0.0:
         raise ValueError("--tfds-max-centroid-distance must be positive.")
+    if int(args.s3_start_epoch) < 0:
+        raise ValueError("--s3-start-epoch must be non-negative.")
+    if int(args.hms_ramp_epochs) < 1:
+        raise ValueError("--hms-ramp-epochs must be >= 1.")
+    if int(args.rdfs_start_epoch) < 0:
+        raise ValueError("--rdfs-start-epoch must be >= 0.")
+    if int(args.rdfs_ramp_epochs) < 1:
+        raise ValueError("--rdfs-ramp-epochs must be >= 1.")
+    if float(args.crs_lambda) < 0.0:
+        raise ValueError("--crs-lambda must be non-negative.")
+    if int(args.crs_start_epoch) < 0:
+        raise ValueError("--crs-start-epoch must be >= 0.")
+    if int(args.crs_ramp_epochs) < 1:
+        raise ValueError("--crs-ramp-epochs must be >= 1.")
+    if int(args.crs_safe_kernel) <= 0 or int(args.crs_safe_kernel) % 2 == 0:
+        raise ValueError("--crs-safe-kernel must be a positive odd integer.")
     if int(getattr(args, "ownership_ignore_dilation", 3)) <= 0 or (
         int(getattr(args, "ownership_ignore_dilation", 3)) % 2 == 0
     ):
@@ -352,6 +456,22 @@ def get_method_name(args):
             "rods_random": "RODS-Random",
             "rods_area_only": "RODS-AreaOnly",
             "tfds_projection": "TCDS-Projection",
+            "tfds_projection_active_renorm": "TCDS-Projection-ActiveRenorm",
+            "tgds_halfspace": "TGDS-Halfspace",
+            "tsds_lift": "TSDS-Lift",
+            "prds_regret": "PRDS-Regret",
+            "cscs_leave_one_out": "CSCS-LeaveOneOut",
+            "sfds_filtration": "SFDS-Filtration",
+            "asfs_anchor_filtration": "ASFS-AnchorFiltration",
+            "rdfs_continuation": "RDFS-Continuation",
+            "crs_flip_suppression": "SDRR-ScaleDeletionResponsibility",
+            "legacy_no_s3": "MSHNet-Control-NoS3",
+            "legacy_no_s2s3": "MSHNet-Control-NoS2S3",
+            "legacy_s0_only": "MSHNet-Control-S0Only",
+            "legacy_s3_delayed": "MSHNet-Control-S3Delayed",
+            "hms_continuation": "MSHNet-HMS-Continuation",
+            "mcsls_null_safe": "MSHNet-MC-SLS",
+            "zmsls_null_abstain": "MSHNet-ZM-SLS-Abstain",
         }
         return names.get(deep_supervision, "MSHNet-" + deep_supervision)
     if is_cev_control(args.model_type):
@@ -480,6 +600,17 @@ def get_method_metadata(args):
         "tfds_max_centroid_distance": float(
             getattr(args, "tfds_max_centroid_distance", 3.0)
         ),
+        "s3_start_epoch": int(getattr(args, "s3_start_epoch", 20)),
+        "hms_ramp_epochs": int(getattr(args, "hms_ramp_epochs", 20)),
+        "rdfs_start_epoch": int(getattr(args, "rdfs_start_epoch", 20)),
+        "rdfs_ramp_epochs": int(getattr(args, "rdfs_ramp_epochs", 20)),
+        "crs_lambda": float(getattr(args, "crs_lambda", 0.05)),
+        "crs_start_epoch": int(getattr(args, "crs_start_epoch", 250)),
+        "crs_ramp_epochs": int(getattr(args, "crs_ramp_epochs", 50)),
+        "crs_safe_kernel": int(getattr(args, "crs_safe_kernel", 15)),
+        "crs_detach_scale_evidence": bool(
+            getattr(args, "crs_detach_scale_evidence", False)
+        ),
         "predictive_state_channels": int(
             getattr(args, "predictive_state_channels", 32)
         ),
@@ -600,6 +731,22 @@ def parse_args():
             'rods_random',
             'rods_area_only',
             'tfds_projection',
+            'tfds_projection_active_renorm',
+            'tgds_halfspace',
+            'tsds_lift',
+            'prds_regret',
+            'cscs_leave_one_out',
+            'sfds_filtration',
+            'asfs_anchor_filtration',
+            'rdfs_continuation',
+            'crs_flip_suppression',
+            'legacy_no_s3',
+            'legacy_no_s2s3',
+            'legacy_s0_only',
+            'legacy_s3_delayed',
+            'hms_continuation',
+            'mcsls_null_safe',
+            'zmsls_null_abstain',
         ],
         help='Deep-supervision training topology for MSHNet.',
     )
@@ -624,6 +771,22 @@ def parse_args():
     parser.add_argument('--rods-log-interval', type=int, default=50)
     parser.add_argument('--tfds-min-iou', type=float, default=0.5)
     parser.add_argument('--tfds-max-centroid-distance', type=float, default=3.0)
+    parser.add_argument('--s3-start-epoch', type=int, default=20)
+    parser.add_argument('--hms-ramp-epochs', type=int, default=20)
+    parser.add_argument('--rdfs-start-epoch', type=int, default=20)
+    parser.add_argument('--rdfs-ramp-epochs', type=int, default=20)
+    parser.add_argument('--crs-lambda', type=float, default=0.05)
+    parser.add_argument('--crs-start-epoch', type=int, default=250)
+    parser.add_argument('--crs-ramp-epochs', type=int, default=50)
+    parser.add_argument('--crs-safe-kernel', type=int, default=15)
+    parser.add_argument(
+        '--crs-detach-scale-evidence', type=str2bool, default=False,
+        help=(
+            'Backpropagate the responsibility term only into the native final '
+            'fusion convolution; canonical segmentation gradients still train '
+            'the full MSHNet.'
+        ),
+    )
     parser.add_argument('--init-from-baseline', type=str, default='')
     parser.add_argument('--cev-kernel-size', type=int, default=7)
     parser.add_argument('--cev-initial-bias', type=float, default=-6.0)
@@ -880,7 +1043,12 @@ class Trainer(object):
         self.loss_fun = SLSIoULoss()
         self.masked_owned_loss = MaskedOwnedScaleIoULoss()
         self.partial_sls_loss = PartialSLSIoULoss()
+        self.measure_conditioned_sls_loss = MeasureConditionedSLSIoULoss()
+        self.zero_measure_sls_loss = MeasureConditionedSLSIoULoss(
+            null_mode="abstain"
+        )
         self.last_deep_supervision_log = {}
+        self.last_tgds_components = None
         graph_mode = {
             "rods_interval": "interval",
             "rods_hard": "hard",
@@ -1141,6 +1309,94 @@ class Trainer(object):
                 'tfds_max_centroid_distance',
                 'test_split_sha256',
             )
+        elif (
+            self.args.model_type == 'mshnet'
+            and is_scheduled_deep_supervision(
+                getattr(self.args, "deep_supervision", "")
+            )
+        ):
+            semantic_keys = (
+                'model_type',
+                'deep_supervision',
+                's3_start_epoch',
+                'test_split_sha256',
+            )
+        elif (
+            self.args.model_type == 'mshnet'
+            and is_homotopy_deep_supervision(
+                getattr(self.args, "deep_supervision", "")
+            )
+        ):
+            semantic_keys = (
+                'model_type',
+                'deep_supervision',
+                'hms_ramp_epochs',
+                'test_split_sha256',
+            )
+        elif (
+            self.args.model_type == 'mshnet'
+            and is_responsibility_deep_supervision(
+                getattr(self.args, "deep_supervision", "")
+            )
+        ):
+            semantic_keys = (
+                'model_type',
+                'deep_supervision',
+                'crs_lambda',
+                'crs_start_epoch',
+                'crs_ramp_epochs',
+                'crs_safe_kernel',
+                'crs_detach_scale_evidence',
+                'test_split_sha256',
+            )
+        elif (
+            self.args.model_type == 'mshnet'
+            and getattr(self.args, "deep_supervision", "")
+            == "rdfs_continuation"
+        ):
+            semantic_keys = (
+                'model_type',
+                'deep_supervision',
+                'rdfs_start_epoch',
+                'rdfs_ramp_epochs',
+                'test_split_sha256',
+            )
+        elif (
+            self.args.model_type == 'mshnet'
+            and is_measure_conditioned_deep_supervision(
+                getattr(self.args, "deep_supervision", "")
+            )
+        ):
+            semantic_keys = (
+                'model_type',
+                'deep_supervision',
+                'test_split_sha256',
+            )
+        elif (
+            self.args.model_type == 'mshnet'
+            and (
+                is_tgds_deep_supervision(
+                    getattr(self.args, "deep_supervision", "")
+                )
+                or is_tsds_deep_supervision(
+                    getattr(self.args, "deep_supervision", "")
+                )
+                or is_prds_deep_supervision(
+                    getattr(self.args, "deep_supervision", "")
+                )
+                or is_coalition_deep_supervision(
+                    getattr(self.args, "deep_supervision", "")
+                )
+                or is_scale_subset_deep_supervision(
+                    getattr(self.args, "deep_supervision", "")
+                )
+            )
+        ):
+            semantic_keys = (
+                'model_type',
+                'deep_supervision',
+                'test_split_sha256',
+            )
         elif self.args.model_type == 'mshnet':
             semantic_keys = (
                 'model_type',
@@ -1299,7 +1555,28 @@ class Trainer(object):
             # MSHNet checkpoint; terminal scale routing must be exercised from
             # the first optimization step.
             return True
+        if is_homotopy_deep_supervision(
+            getattr(self.args, "deep_supervision", "")
+        ):
+            return True
         return epoch > self.warm_epoch
+
+    def get_hms_alpha(self, epoch):
+        if not is_homotopy_deep_supervision(
+            getattr(self.args, "deep_supervision", "")
+        ):
+            return 1.0
+        return min(
+            1.0,
+            max(0.0, float(epoch) / float(self.args.hms_ramp_epochs)),
+        )
+
+    def get_rdfs_alpha(self, epoch):
+        if getattr(self.args, "deep_supervision", "") != "rdfs_continuation":
+            return 1.0
+        start = int(self.args.rdfs_start_epoch)
+        ramp = int(self.args.rdfs_ramp_epochs)
+        return min(1.0, max(0.0, float(epoch - start) / float(ramp)))
 
     def get_full_dea_ramp(self, epoch):
         if epoch < self.args.full_dea_start_epoch:
@@ -1624,6 +1901,51 @@ class Trainer(object):
         self.last_deep_supervision_log = {
             "final_loss_raw": final_loss.detach(),
         }
+        self.last_tgds_components = None
+        if is_measure_conditioned_deep_supervision(mode):
+            conditioned_loss = (
+                self.zero_measure_sls_loss
+                if mode == "zmsls_null_abstain"
+                else self.measure_conditioned_sls_loss
+            )
+            final_loss = conditioned_loss(
+                pred,
+                labels,
+                self.warm_epoch,
+                epoch,
+            )
+            self.last_deep_supervision_log["final_loss_raw"] = (
+                final_loss.detach()
+            )
+            loss = final_loss
+            labels_for_scale = labels
+            null_ratios = [
+                (labels.flatten(1).sum(dim=1) == 0).float().mean()
+            ]
+            for side_index, side_logit in enumerate(masks):
+                if side_index > 0:
+                    labels_for_scale = self.down(labels_for_scale)
+                side_loss = conditioned_loss(
+                    side_logit,
+                    labels_for_scale,
+                    self.warm_epoch,
+                    epoch,
+                )
+                loss = loss + side_loss
+                null_ratio = (
+                    labels_for_scale.flatten(1).sum(dim=1) == 0
+                ).float().mean()
+                null_ratios.append(null_ratio)
+                self.last_deep_supervision_log.update({
+                    "side%d_loss" % side_index: side_loss.detach(),
+                    "side%d_null_ratio" % side_index: null_ratio,
+                })
+            self.last_deep_supervision_log.update({
+                "final_null_ratio": null_ratios[0],
+                "measure_conditioned": 1.0,
+                "canonical_aggregation": 1.0,
+            })
+            return loss / (len(masks) + 1)
         if mode == "legacy_exact":
             loss = final_loss
             labels_for_scale = labels
@@ -1635,8 +1957,169 @@ class Trainer(object):
                 )
             return loss / (len(masks) + 1)
 
+        if is_homotopy_deep_supervision(mode):
+            alpha = self.get_hms_alpha(epoch)
+            labels_for_scale = labels
+            side_losses = []
+            for side_index, side_logit in enumerate(masks):
+                if side_index > 0:
+                    labels_for_scale = self.down(labels_for_scale)
+                side_loss = self.loss_fun(
+                    side_logit,
+                    labels_for_scale,
+                    self.warm_epoch,
+                    epoch,
+                )
+                side_losses.append(side_loss)
+                self.last_deep_supervision_log[
+                    "side%d_loss" % side_index
+                ] = side_loss.detach()
+            canonical = (final_loss + torch.stack(side_losses).sum()) / (
+                len(side_losses) + 1
+            )
+            total = (1.0 - alpha) * final_loss + alpha * canonical
+            self.last_deep_supervision_log.update({
+                "hms_alpha": alpha,
+                "canonical_loss": canonical.detach(),
+                "homotopy_continuation": 1.0,
+            })
+            return total
+
+        if is_scale_subset_deep_supervision(mode):
+            active_indices = SCALE_SUBSET_DEEP_SUPERVISION[mode]
+            labels_for_scale = labels
+            side_losses = []
+            for side_index, side_logit in enumerate(masks):
+                if side_index > 0:
+                    labels_for_scale = self.down(labels_for_scale)
+                if side_index not in active_indices:
+                    continue
+                side_loss = self.loss_fun(
+                    side_logit,
+                    labels_for_scale,
+                    self.warm_epoch,
+                    epoch,
+                )
+                side_losses.append(side_loss)
+                self.last_deep_supervision_log[
+                    "side%d_loss" % side_index
+                ] = side_loss.detach()
+            if not side_losses:
+                self.last_deep_supervision_log["active_side_count"] = 0.0
+                self.last_deep_supervision_log["subset_control"] = 1.0
+                return final_loss
+            total = (final_loss + torch.stack(side_losses).sum()) / (
+                len(side_losses) + 1
+            )
+            self.last_deep_supervision_log["active_side_count"] = float(
+                len(active_indices)
+            )
+            self.last_deep_supervision_log["subset_control"] = 1.0
+            return total
+
+        if is_scheduled_deep_supervision(mode):
+            labels_for_scale = labels
+            side_losses = []
+            active_indices = (0, 1, 2) if epoch < self.args.s3_start_epoch else (0, 1, 2, 3)
+            for side_index, side_logit in enumerate(masks):
+                if side_index > 0:
+                    labels_for_scale = self.down(labels_for_scale)
+                if side_index not in active_indices:
+                    continue
+                side_loss = self.loss_fun(
+                    side_logit,
+                    labels_for_scale,
+                    self.warm_epoch,
+                    epoch,
+                )
+                side_losses.append(side_loss)
+                self.last_deep_supervision_log[
+                    "side%d_loss" % side_index
+                ] = side_loss.detach()
+            if not side_losses:
+                return final_loss
+            total = (final_loss + torch.stack(side_losses).sum()) / (
+                len(side_losses) + 1
+            )
+            self.last_deep_supervision_log.update({
+                "active_side_count": float(len(active_indices)),
+                "s3_enabled": float(3 in active_indices),
+                "s3_start_epoch": float(self.args.s3_start_epoch),
+                "scheduled_control": 1.0,
+            })
+            return total
+
         if not masks or mode == "final_only":
             return final_loss
+
+        if is_responsibility_deep_supervision(mode):
+            canonical_sum = final_loss
+            labels_for_scale = labels
+            for side_index, side_logit in enumerate(masks):
+                if side_index > 0:
+                    labels_for_scale = self.down(labels_for_scale)
+                side_loss = self.loss_fun(
+                    side_logit,
+                    labels_for_scale,
+                    self.warm_epoch,
+                    epoch,
+                )
+                canonical_sum = canonical_sum + side_loss
+                self.last_deep_supervision_log[
+                    "side%d_loss" % side_index
+                ] = side_loss.detach()
+            canonical_total = canonical_sum / (len(masks) + 1)
+            start = int(self.args.crs_start_epoch)
+            ramp = min(
+                1.0,
+                max(
+                    0.0,
+                    float(epoch - start) / float(self.args.crs_ramp_epochs),
+                ),
+            )
+            if ramp == 0.0 or float(self.args.crs_lambda) == 0.0:
+                self.last_deep_supervision_log.update({
+                    "canonical_loss": canonical_total.detach(),
+                    "crs_ramp": ramp,
+                    "crs_identity": 1.0,
+                })
+                return canonical_total
+
+            base_model = (
+                self.model.module
+                if isinstance(self.model, nn.DataParallel)
+                else self.model
+            )
+            coalition = leave_one_scale_out_coalitions(
+                (
+                    tuple(mask.detach() for mask in masks)
+                    if bool(self.args.crs_detach_scale_evidence)
+                    else masks
+                ),
+                pred,
+                base_model.final,
+            )
+            responsibility_loss, responsibility_log = (
+                counterfactual_responsibility_suppression(
+                    pred,
+                    coalition["contributions"],
+                    labels,
+                    safe_kernel=int(self.args.crs_safe_kernel),
+                )
+            )
+            weighted = float(self.args.crs_lambda) * ramp * responsibility_loss
+            self.last_deep_supervision_log.update({
+                "canonical_loss": canonical_total.detach(),
+                "crs_loss_raw": responsibility_loss.detach(),
+                "crs_loss_weighted": weighted.detach(),
+                "crs_ramp": ramp,
+                "counterfactual_responsibility": 1.0,
+                "crs_detach_scale_evidence": float(
+                    bool(self.args.crs_detach_scale_evidence)
+                ),
+                **responsibility_log,
+            })
+            return canonical_total + weighted
 
         if is_tfds_deep_supervision(mode):
             if instance_map is None:
@@ -1650,13 +2133,31 @@ class Trainer(object):
                     assignment,
                     side_index,
                 )
-                side_loss = self.partial_sls_loss(
+                per_sample_loss = self.partial_sls_loss(
                     side_logit,
                     target,
                     valid,
                     self.warm_epoch,
                     epoch,
+                    reduction="none",
                 )
+                all_valid_sample = (valid == 1).flatten(1).all(dim=1)
+                gradient_active = active | all_valid_sample
+                if mode == "tfds_projection_active_renorm":
+                    # Diagnostic definition: renormalize only sample-head pairs
+                    # that retain at least one known positive.  Canonical empty
+                    # crops remain visible in gradient_active_ratio but are not
+                    # counted in the positive-supervision budget.
+                    active_float = active.to(per_sample_loss.dtype)
+                    active_count = active_float.sum()
+                    if bool((active_count > 0).detach().cpu()):
+                        side_loss = (
+                            per_sample_loss * active_float
+                        ).sum() / active_count
+                    else:
+                        side_loss = per_sample_loss.sum() * 0.0
+                else:
+                    side_loss = per_sample_loss.mean()
                 side_losses.append(side_loss)
                 graph_values = [
                     graph[:, side_index].float()
@@ -1669,8 +2170,15 @@ class Trainer(object):
                     else side_logit.new_zeros(())
                 )
                 log_vars["side%d_loss" % side_index] = side_loss.detach()
-                log_vars["side%d_active_ratio" % side_index] = active.float().mean()
+                log_vars["side%d_positive_active_ratio" % side_index] = (
+                    active.float().mean()
+                )
+                log_vars["side%d_gradient_active_ratio" % side_index] = (
+                    gradient_active.float().mean()
+                )
                 log_vars["side%d_valid_ratio" % side_index] = valid.mean()
+                log_vars["side%d_unknown_ratio" % side_index] = 1.0 - valid.mean()
+                log_vars["side%d_positive_pixel_ratio" % side_index] = target.mean()
                 log_vars["side%d_feasible_ratio" % side_index] = feasible_ratio.detach()
 
             # Preserve canonical MSHNet's exact five-objective aggregation.
@@ -1679,6 +2187,288 @@ class Trainer(object):
             )
             self.last_deep_supervision_log.update(log_vars)
             self.last_deep_supervision_log["canonical_aggregation"] = 1.0
+            self.last_deep_supervision_log["active_renorm"] = float(
+                mode == "tfds_projection_active_renorm"
+            )
+            return total
+
+        if is_tgds_deep_supervision(mode):
+            labels_for_scale = labels
+            side_losses = []
+            for side_index, side_logit in enumerate(masks):
+                if side_index > 0:
+                    labels_for_scale = self.down(labels_for_scale)
+                side_loss = self.loss_fun(
+                    side_logit,
+                    labels_for_scale,
+                    self.warm_epoch,
+                    epoch,
+                )
+                side_losses.append(side_loss)
+                self.last_deep_supervision_log[
+                    "side%d_loss" % side_index
+                ] = side_loss.detach()
+
+            total = (final_loss + torch.stack(side_losses).sum()) / (
+                len(side_losses) + 1
+            )
+            self.last_tgds_components = (final_loss, tuple(side_losses))
+            self.last_deep_supervision_log["canonical_aggregation"] = 1.0
+            self.last_deep_supervision_log["task_halfspace"] = 1.0
+            return total
+
+        if is_tsds_deep_supervision(mode):
+            side_losses = []
+            for side_index, side_logit in enumerate(masks):
+                lifted_logit = (
+                    side_logit
+                    if side_logit.shape[-2:] == labels.shape[-2:]
+                    else F.interpolate(
+                        side_logit,
+                        size=labels.shape[-2:],
+                        mode="bilinear",
+                        align_corners=True,
+                    )
+                )
+                side_loss = self.loss_fun(
+                    lifted_logit,
+                    labels,
+                    self.warm_epoch,
+                    epoch,
+                )
+                side_losses.append(side_loss)
+                self.last_deep_supervision_log[
+                    "side%d_task_loss" % side_index
+                ] = side_loss.detach()
+            total = (final_loss + torch.stack(side_losses).sum()) / (
+                len(side_losses) + 1
+            )
+            self.last_deep_supervision_log["canonical_aggregation"] = 1.0
+            self.last_deep_supervision_log["task_space_lift"] = 1.0
+            return total
+
+        if is_prds_deep_supervision(mode):
+            projected_label = labels
+            side_regrets = []
+            full_valid = torch.ones_like(labels)
+            for side_index, side_logit in enumerate(masks):
+                if side_index > 0:
+                    projected_label = self.down(projected_label)
+                lifted_logit = (
+                    side_logit
+                    if side_logit.shape[-2:] == labels.shape[-2:]
+                    else F.interpolate(
+                        side_logit,
+                        size=labels.shape[-2:],
+                        mode="bilinear",
+                        align_corners=True,
+                    )
+                )
+                oracle_lift = (
+                    projected_label
+                    if projected_label.shape[-2:] == labels.shape[-2:]
+                    else F.interpolate(
+                        projected_label,
+                        size=labels.shape[-2:],
+                        mode="nearest",
+                    )
+                )
+                oracle_logit = torch.where(
+                    oracle_lift > 0.5,
+                    torch.full_like(oracle_lift, 12.0),
+                    torch.full_like(oracle_lift, -12.0),
+                )
+                current_terms = self.partial_sls_loss(
+                    lifted_logit,
+                    labels,
+                    full_valid,
+                    self.warm_epoch,
+                    epoch,
+                    reduction="none",
+                )
+                oracle_terms = self.partial_sls_loss(
+                    oracle_logit,
+                    labels,
+                    full_valid,
+                    self.warm_epoch,
+                    epoch,
+                    reduction="none",
+                ).detach()
+                regret_terms = torch.relu(current_terms - oracle_terms)
+                side_regret = regret_terms.mean()
+                side_regrets.append(side_regret)
+                self.last_deep_supervision_log.update({
+                    "side%d_regret" % side_index: side_regret.detach(),
+                    "side%d_regret_active_ratio" % side_index: (
+                        regret_terms > 0
+                    ).float().mean(),
+                    "side%d_oracle_floor" % side_index: oracle_terms.mean(),
+                    "side%d_task_loss" % side_index: current_terms.mean().detach(),
+                })
+            total = (final_loss + torch.stack(side_regrets).sum()) / (
+                len(side_regrets) + 1
+            )
+            self.last_deep_supervision_log["canonical_aggregation"] = 1.0
+            self.last_deep_supervision_log["projection_regret"] = 1.0
+            return total
+
+        if is_coalition_deep_supervision(mode):
+            base_model = (
+                self.model.module
+                if isinstance(self.model, nn.DataParallel)
+                else self.model
+            )
+            if mode == "sfds_filtration":
+                filtration = nested_scale_filtration(
+                    masks,
+                    pred,
+                    base_model.final,
+                )
+                filtration_losses = []
+                for terminal_scale in range(4):
+                    filtration_logit = filtration["filtration_logits"][
+                        :, terminal_scale : terminal_scale + 1
+                    ]
+                    filtration_loss = self.loss_fun(
+                        filtration_logit,
+                        labels,
+                        self.warm_epoch,
+                        epoch,
+                    )
+                    filtration_losses.append(filtration_loss)
+                    self.last_deep_supervision_log[
+                        "prefix0to%d_loss" % terminal_scale
+                    ] = filtration_loss.detach()
+                total = torch.stack(filtration_losses).mean()
+                reconstruction_error = (
+                    filtration["reconstructed"] - pred
+                ).abs().max()
+                self.last_deep_supervision_log.update({
+                    "filtration_reconstruction_error": (
+                        reconstruction_error.detach()
+                    ),
+                    "nested_scale_filtration": 1.0,
+                    "objective_count": 4.0,
+                })
+                return total
+
+            if mode in ("asfs_anchor_filtration", "rdfs_continuation"):
+                canonical_total = None
+                rdfs_alpha = 1.0
+                if mode == "rdfs_continuation":
+                    rdfs_alpha = self.get_rdfs_alpha(epoch)
+                    canonical_sum = final_loss
+                    labels_for_scale = labels
+                    for side_index, side_logit in enumerate(masks):
+                        if side_index > 0:
+                            labels_for_scale = self.down(labels_for_scale)
+                        canonical_sum = canonical_sum + self.loss_fun(
+                            side_logit,
+                            labels_for_scale,
+                            self.warm_epoch,
+                            epoch,
+                        )
+                    canonical_total = canonical_sum / (len(masks) + 1)
+                    if rdfs_alpha == 0.0:
+                        self.last_deep_supervision_log.update({
+                            "rdfs_alpha": 0.0,
+                            "role_discovery": 1.0,
+                            "canonical_loss": canonical_total.detach(),
+                        })
+                        return canonical_total
+
+                filtration = nested_scale_filtration(
+                    masks,
+                    pred,
+                    base_model.final,
+                )
+                side0_loss = self.loss_fun(
+                    masks[0], labels, self.warm_epoch, epoch
+                )
+                side1_loss = self.loss_fun(
+                    masks[1],
+                    self.down(labels),
+                    self.warm_epoch,
+                    epoch,
+                )
+                prefix1_loss = self.loss_fun(
+                    filtration["filtration_logits"][:, 1:2],
+                    labels,
+                    self.warm_epoch,
+                    epoch,
+                )
+                prefix2_loss = self.loss_fun(
+                    filtration["filtration_logits"][:, 2:3],
+                    labels,
+                    self.warm_epoch,
+                    epoch,
+                )
+                terms = (
+                    side0_loss,
+                    side1_loss,
+                    prefix1_loss,
+                    prefix2_loss,
+                    final_loss,
+                )
+                anchor_total = torch.stack(terms).mean()
+                total = anchor_total
+                if mode == "rdfs_continuation":
+                    total = (
+                        (1.0 - rdfs_alpha) * canonical_total
+                        + rdfs_alpha * anchor_total
+                    )
+                reconstruction_error = (
+                    filtration["reconstructed"] - pred
+                ).abs().max()
+                self.last_deep_supervision_log.update({
+                    "anchor_side0_loss": side0_loss.detach(),
+                    "anchor_side1_loss": side1_loss.detach(),
+                    "prefix0to1_loss": prefix1_loss.detach(),
+                    "prefix0to2_loss": prefix2_loss.detach(),
+                    "anchor_filtration_reconstruction_error": (
+                        reconstruction_error.detach()
+                    ),
+                    "anchor_filtration": 1.0,
+                    "canonical_objective_count": 5.0,
+                })
+                if mode == "rdfs_continuation":
+                    self.last_deep_supervision_log.update({
+                        "rdfs_alpha": rdfs_alpha,
+                        "role_discovery": float(rdfs_alpha < 1.0),
+                        "canonical_loss": canonical_total.detach(),
+                        "anchor_filtration_loss": anchor_total.detach(),
+                    })
+                return total
+
+            coalition = leave_one_scale_out_coalitions(
+                masks, pred, base_model.final
+            )
+            coalition_losses = []
+            for deleted_scale in range(4):
+                coalition_logit = coalition["coalition_logits"][
+                    :, deleted_scale : deleted_scale + 1
+                ]
+                coalition_loss = self.loss_fun(
+                    coalition_logit,
+                    labels,
+                    self.warm_epoch,
+                    epoch,
+                )
+                coalition_losses.append(coalition_loss)
+                self.last_deep_supervision_log[
+                    "without_scale%d_loss" % deleted_scale
+                ] = coalition_loss.detach()
+            total = (
+                final_loss + torch.stack(coalition_losses).sum()
+            ) / 5.0
+            reconstruction_error = (
+                coalition["reconstructed"] - pred
+            ).abs().max()
+            self.last_deep_supervision_log.update({
+                "coalition_reconstruction_error": reconstruction_error.detach(),
+                "counterfactual_coalition": 1.0,
+                "canonical_objective_count": 5.0,
+            })
             return total
 
         if mode in ("legacy_rescaled", "side_no_location"):
@@ -1749,6 +2539,56 @@ class Trainer(object):
         self.last_deep_supervision_log.update(log_vars)
         return final_loss + self.args.aux_loss_weight * aux_loss
 
+    def backward_task_gradient_supervision(self):
+        """Apply the asymmetric TGDS constraint in parameter space."""
+
+        if self.last_tgds_components is None:
+            raise RuntimeError("TGDS backward requires stored loss components")
+        final_loss, side_losses = self.last_tgds_components
+        parameters = tuple(
+            parameter
+            for parameter in self.model.parameters()
+            if parameter.requires_grad
+        )
+        task_gradient = torch.autograd.grad(
+            final_loss,
+            parameters,
+            retain_graph=True,
+            create_graph=False,
+            allow_unused=True,
+        )
+        projected_auxiliary = []
+        for side_index, side_loss in enumerate(side_losses):
+            auxiliary_gradient = torch.autograd.grad(
+                side_loss,
+                parameters,
+                retain_graph=side_index + 1 < len(side_losses),
+                create_graph=False,
+                allow_unused=True,
+            )
+            projected, statistics = project_auxiliary_gradient(
+                task_gradient,
+                auxiliary_gradient,
+            )
+            projected_auxiliary.append(projected)
+            post_inner = gradient_inner_product(task_gradient, projected)
+            self.last_deep_supervision_log.update({
+                "side%d_gradient_cosine" % side_index: statistics["cosine"],
+                "side%d_conflict" % side_index: statistics["conflict"],
+                "side%d_task_grad_norm" % side_index: statistics["task_norm"],
+                "side%d_aux_grad_norm" % side_index: statistics["auxiliary_norm"],
+                "side%d_removed_grad_norm" % side_index: statistics["removed_norm"],
+                "side%d_post_inner" % side_index: post_inner.detach(),
+            })
+
+        combined = combine_task_and_auxiliary_gradients(
+            task_gradient,
+            projected_auxiliary,
+            denominator=float(len(side_losses) + 1),
+        )
+        for parameter, gradient in zip(parameters, combined):
+            parameter.grad = None if gradient is None else gradient.detach()
+
     def train(self, epoch):
         self.model.train()
         self.configure_full_dea_trainable(epoch)
@@ -1807,7 +2647,18 @@ class Trainer(object):
                     dea_detach_evidence=self.args.dea_detach_evidence,
                 )
             else:
-                masks, pred = self.model(data, tag)
+                fusion_alpha = (
+                    self.get_hms_alpha(epoch)
+                    if is_homotopy_deep_supervision(
+                        getattr(self.args, "deep_supervision", "")
+                    )
+                    else None
+                )
+                masks, pred = self.model(
+                    data,
+                    tag,
+                    fusion_alpha=fusion_alpha,
+                )
                 dea_out = None
 
             if cev_out is not None:
@@ -1828,12 +2679,46 @@ class Trainer(object):
                     epoch,
                 )
             loss_seg_for_debug = loss.detach()
+            tgds_backward_done = False
+            if is_tgds_deep_supervision(
+                getattr(self.args, "deep_supervision", "")
+            ):
+                self.optimizer.zero_grad(set_to_none=True)
+                self.backward_task_gradient_supervision()
+                tgds_backward_done = True
             if (
                 (
                     is_rods_deep_supervision(
                         getattr(self.args, "deep_supervision", "")
                     )
                     or is_tfds_deep_supervision(
+                        getattr(self.args, "deep_supervision", "")
+                    )
+                    or is_tgds_deep_supervision(
+                        getattr(self.args, "deep_supervision", "")
+                    )
+                    or is_tsds_deep_supervision(
+                        getattr(self.args, "deep_supervision", "")
+                    )
+                    or is_prds_deep_supervision(
+                        getattr(self.args, "deep_supervision", "")
+                    )
+                    or is_coalition_deep_supervision(
+                        getattr(self.args, "deep_supervision", "")
+                    )
+                    or is_responsibility_deep_supervision(
+                        getattr(self.args, "deep_supervision", "")
+                    )
+                    or is_scale_subset_deep_supervision(
+                        getattr(self.args, "deep_supervision", "")
+                    )
+                    or is_scheduled_deep_supervision(
+                        getattr(self.args, "deep_supervision", "")
+                    )
+                    or is_homotopy_deep_supervision(
+                        getattr(self.args, "deep_supervision", "")
+                    )
+                    or is_measure_conditioned_deep_supervision(
                         getattr(self.args, "deep_supervision", "")
                     )
                 )
@@ -1846,7 +2731,60 @@ class Trainer(object):
                     if is_tfds_deep_supervision(
                         getattr(self.args, "deep_supervision", "")
                     )
-                    else '[RODS] '
+                    else (
+                        '[TGDS] '
+                        if is_tgds_deep_supervision(
+                            getattr(self.args, "deep_supervision", "")
+                        )
+                        else (
+                            '[TSDS] '
+                            if is_tsds_deep_supervision(
+                                getattr(self.args, "deep_supervision", "")
+                            )
+                            else (
+                                '[PRDS] '
+                                if is_prds_deep_supervision(
+                                    getattr(self.args, "deep_supervision", "")
+                                )
+                                else (
+                                    '[CSCS] '
+                                    if is_coalition_deep_supervision(
+                                        getattr(self.args, "deep_supervision", "")
+                                    )
+                                    else (
+                                        '[CRS] '
+                                        if is_responsibility_deep_supervision(
+                                            getattr(self.args, "deep_supervision", "")
+                                        )
+                                        else (
+                                            '[SCALE CONTROL] '
+                                            if (
+                                                is_scale_subset_deep_supervision(
+                                                    getattr(self.args, "deep_supervision", "")
+                                                )
+                                                or is_scheduled_deep_supervision(
+                                                    getattr(self.args, "deep_supervision", "")
+                                                )
+                                            )
+                                            else (
+                                                '[HMS] '
+                                                if is_homotopy_deep_supervision(
+                                                    getattr(self.args, "deep_supervision", "")
+                                                )
+                                                else (
+                                                    '[MC-SLS] '
+                                                    if is_measure_conditioned_deep_supervision(
+                                                        getattr(self.args, "deep_supervision", "")
+                                                    )
+                                                    else '[RODS] '
+                                                )
+                                            )
+                                        )
+                                    )
+                                )
+                            )
+                        )
+                    )
                 )
                 print(prefix + ' | '.join(msg))
             integrated_route_loss = None
@@ -2007,8 +2945,9 @@ class Trainer(object):
                     self.format_log_dict(stats)
                 ))
         
-            self.optimizer.zero_grad()
-            loss.backward()
+            if not tgds_backward_done:
+                self.optimizer.zero_grad()
+                loss.backward()
             self.optimizer.step()
        
             losses.update(loss.item(), pred.size(0))
