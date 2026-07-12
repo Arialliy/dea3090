@@ -55,6 +55,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sdrr-lambda", type=float, default=0.05)
     parser.add_argument("--safe-kernel", type=int, default=15)
     parser.add_argument("--max-train-batches", type=int, default=64)
+    parser.add_argument("--skip-active-batches", type=int, default=0)
     parser.add_argument("--device", default="auto")
     parser.add_argument("--output", type=Path)
     return parser.parse_args()
@@ -138,6 +139,7 @@ def main() -> None:
     selected_train: tuple[torch.Tensor, torch.Tensor] | None = None
     selected_batch_index = -1
     selection_logs: dict[str, float] = {}
+    active_batches_seen = 0
     model.eval()
     with torch.inference_mode():
         for batch_index, (images, targets) in enumerate(train_loader):
@@ -163,6 +165,9 @@ def main() -> None:
                 safe_kernel=args.safe_kernel,
             )
             if float(logs["responsible_count"]) > 0:
+                if active_batches_seen < args.skip_active_batches:
+                    active_batches_seen += 1
+                    continue
                 selected_train = (images.detach(), targets.detach())
                 selected_batch_index = batch_index
                 selection_logs = _scalar_logs(logs)
@@ -283,6 +288,7 @@ def main() -> None:
         "train_split_sha256": train_dataset.split_sha256,
         "val_split_sha256": val_dataset.split_sha256,
         "selected_train_batch_index": selected_batch_index,
+        "skipped_active_batches": args.skip_active_batches,
         "selection_logs_eval_mode": selection_logs,
         "branch_logs_train_mode": branch_logs,
         "comparisons_against_canonical": results,
