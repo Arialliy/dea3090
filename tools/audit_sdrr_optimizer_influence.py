@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import json
+import os
 import random
 import sys
 from pathlib import Path
@@ -88,9 +89,13 @@ def _scalar_logs(logs: dict[str, torch.Tensor]) -> dict[str, float]:
 
 def main() -> None:
     args = parse_args()
+    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
+    torch.use_deterministic_algorithms(True)
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = True
     device = torch.device(
         "cuda"
         if args.device == "auto" and torch.cuda.is_available()
@@ -211,7 +216,17 @@ def main() -> None:
         "m3_magnitude_nonpivotal": magnitude_matched_nonpivotal_suppression,
         "m4_same_pixel_random_scale": same_pixel_random_scale_suppression,
     }
-    results = {}
+    results = {
+        "canonical_identity": dataclasses.asdict(
+            optimizer_counterfactual(
+                model,
+                optimizer,
+                with_edge_loss=base_closure,
+                without_edge_loss=base_closure,
+                probe_loss=probe_closure,
+            )
+        )
+    }
     for name, regularizer in regularizers.items():
         def with_regularizer(
             current: nn.Module,
