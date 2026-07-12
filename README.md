@@ -83,6 +83,7 @@ The earlier scale-ownership plan is retained in
 │   ├── audit_task_consistent_projection.py
 │   ├── audit_counterfactual_responsibility.py
 │   ├── audit_sdrr_deletion_stability.py
+│   ├── audit_sdrr_optimizer_influence.py
 │   ├── branch_sdrr_shared_prefix.py
 │   ├── summarize_sdrr_formal.py
 │   └── optimizer_counterfactual.py
@@ -242,13 +243,15 @@ python -m pytest -q
 The test suite covers clean-baseline identity, deterministic-backward behavior,
 direct zero-channel deletion, decision-margin stability, responsibility
 normalization, matched-control gradient support, shared-prefix branching,
-formal summary fail-closed checks, projection identities, coalition
-reconstruction, optimizer counterfactuals, dataset splits, and metrics.
+exact canonical gradients when no responsibility event exists, formal summary
+fail-closed checks, projection identities, coalition reconstruction, one-step
+optimizer counterfactuals, dataset splits, and metrics.
 
 Key SDRR audit entry points are:
 
 ```bash
 python tools/audit_sdrr_deletion_stability.py --help
+python tools/audit_sdrr_optimizer_influence.py --help
 python tools/branch_sdrr_shared_prefix.py --help
 python tools/summarize_sdrr_formal.py --help
 ```

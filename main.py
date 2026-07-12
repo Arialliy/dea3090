@@ -2261,6 +2261,18 @@ class Trainer(object):
                 ),
                 **responsibility_log,
             })
+            active_count = responsibility_log.get(
+                "control_selected_count",
+                responsibility_log["responsible_count"],
+            )
+            if bool((active_count == 0).detach().cpu()):
+                # A numerically zero auxiliary graph can still alter gradient
+                # accumulation order and Adagrad trajectories.  Preserve the
+                # stronger invariant: no selected event returns the exact
+                # canonical loss object and therefore the exact canonical
+                # backward graph.
+                self.last_deep_supervision_log["crs_identity"] = 1.0
+                return canonical_total
             return canonical_total + weighted
 
         if is_tfds_deep_supervision(mode):

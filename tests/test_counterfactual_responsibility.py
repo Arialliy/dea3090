@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import copy
+
 import torch
 import torch.nn as nn
 
@@ -283,4 +285,68 @@ def test_crs_before_start_is_exact_canonical_mshnet_loss() -> None:
         expected_sum = expected_sum + trainer.loss_fun(mask, target, 5, 19)
 
     torch.testing.assert_close(actual, expected_sum / 5.0, rtol=0.0, atol=0.0)
+    assert trainer.last_deep_supervision_log["crs_identity"] == 1.0
+
+
+def test_crs_no_event_after_start_has_exact_canonical_parameter_gradients() -> None:
+    torch.manual_seed(53)
+    actual_model = MSHNet(3).train()
+    canonical_model = copy.deepcopy(actual_model).train()
+    images = torch.randn(2, 3, 32, 32)
+    # Every pixel is protected, so responsibility must be empty independent
+    # of the random model's logits.
+    labels = torch.ones(2, 1, 32, 32)
+
+    trainer = Trainer.__new__(Trainer)
+    trainer.args = type(
+        "Args",
+        (),
+        {
+            "deep_supervision": "crs_flip_suppression",
+            "crs_lambda": 0.05,
+            "crs_start_epoch": 0,
+            "crs_ramp_epochs": 1,
+            "crs_safe_kernel": 15,
+            "crs_detach_scale_evidence": False,
+            "sdrr_normalization": "event",
+        },
+    )()
+    trainer.model = actual_model
+    trainer.loss_fun = SLSIoULoss()
+    trainer.down = nn.MaxPool2d(2, 2)
+    trainer.warm_epoch = 5
+    trainer.last_deep_supervision_log = {}
+    trainer.last_tgds_components = None
+
+    actual_masks, actual_prediction = actual_model(images, True)
+    actual_loss = trainer.compute_deep_supervision_loss(
+        actual_prediction,
+        actual_masks,
+        labels,
+        instance_map=None,
+        epoch=1,
+    )
+    actual_loss.backward()
+
+    canonical_masks, canonical_prediction = canonical_model(images, True)
+    canonical_sum = trainer.loss_fun(canonical_prediction, labels, 5, 1)
+    scale_target = labels
+    for index, mask in enumerate(canonical_masks):
+        if index > 0:
+            scale_target = trainer.down(scale_target)
+        canonical_sum = canonical_sum + trainer.loss_fun(mask, scale_target, 5, 1)
+    canonical_loss = canonical_sum / 5.0
+    canonical_loss.backward()
+
+    torch.testing.assert_close(actual_loss, canonical_loss, rtol=0.0, atol=0.0)
+    for (actual_name, actual_parameter), (canonical_name, canonical_parameter) in zip(
+        actual_model.named_parameters(), canonical_model.named_parameters()
+    ):
+        assert actual_name == canonical_name
+        if actual_parameter.grad is None or canonical_parameter.grad is None:
+            assert actual_parameter.grad is None
+            assert canonical_parameter.grad is None
+            continue
+        assert torch.equal(actual_parameter.grad, canonical_parameter.grad), actual_name
+    assert trainer.last_deep_supervision_log["responsible_count"] == 0
     assert trainer.last_deep_supervision_log["crs_identity"] == 1.0
