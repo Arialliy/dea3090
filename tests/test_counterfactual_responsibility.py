@@ -8,12 +8,17 @@ import torch.nn as nn
 from main import Trainer
 from model.MSHNet import MSHNet
 from model.counterfactual_responsibility import (
+    all_safe_positive_fused_suppression,
     build_safe_background,
     build_responsibility_mask,
     counterfactual_responsibility_suppression,
     matched_random_responsibility_suppression,
+    match_parameter_gradient_l2,
     magnitude_matched_nonpivotal_suppression,
+    responsibility_conserving_gradient_routing,
+    responsibility_density_risk,
     same_pixel_random_scale_suppression,
+    same_responsible_pixel_fused_suppression,
 )
 from model.loss import SLSIoULoss
 from model.scale_coalition_supervision import leave_one_scale_out_coalitions
@@ -211,6 +216,111 @@ def test_magnitude_control_selects_nearest_nonpivotal_same_scale() -> None:
     assert logs["control_shortage_count"] == 0
 
 
+def test_magnitude_control_writes_selection_for_multi_image_batch() -> None:
+    z_full = torch.tensor(
+        [
+            [[[1.0, 1.2]]],
+            [[[1.0, 1.2]]],
+        ]
+    )
+    contributions = torch.zeros(2, 4, 1, 2, requires_grad=True)
+    with torch.no_grad():
+        contributions[:, 0, 0] = torch.tensor([2.0, 0.8])
+    target = torch.zeros_like(z_full)
+
+    loss, logs = magnitude_matched_nonpivotal_suppression(
+        z_full, contributions, target, safe_kernel=1
+    )
+    gradient = torch.autograd.grad(loss, contributions)[0]
+    selected = gradient != 0
+
+    assert logs["responsible_count"] == 2
+    assert logs["control_selected_count"] == 2
+    assert logs["control_budget_match_ratio"] == 1
+    assert selected[0, 0, 0, 1]
+    assert selected[1, 0, 0, 1]
+    assert int(selected.sum()) == 2
+
+
+def test_shared_parameter_gradient_l2_matching_is_exact() -> None:
+    first = nn.Parameter(torch.tensor([1.0, -2.0]))
+    second = nn.Parameter(torch.tensor([0.5]))
+    reference = (3.0 * first).sum() + (4.0 * second).sum()
+    control = (0.5 * first).sum() + (0.25 * second).sum()
+
+    matched, logs = match_parameter_gradient_l2(
+        reference, control, (first, second)
+    )
+    matched_gradients = torch.autograd.grad(matched, (first, second))
+    matched_norm = torch.sqrt(
+        sum(gradient.square().sum() for gradient in matched_gradients)
+    )
+
+    torch.testing.assert_close(matched_norm, logs["reference_shared_gradient_l2"])
+    torch.testing.assert_close(
+        logs["control_shared_gradient_l2_before_scale"]
+        * logs["control_shared_gradient_l2_scale"],
+        logs["reference_shared_gradient_l2"],
+    )
+    assert logs["control_shared_gradient_l2_match_valid"] == 1
+
+
+def test_shared_parameter_gradient_l2_matching_fails_closed_on_nan() -> None:
+    parameter = nn.Parameter(torch.tensor([1.0]))
+    reference = parameter.square().sum()
+    control = (parameter * torch.tensor(float("nan"))).sum()
+
+    matched, logs = match_parameter_gradient_l2(
+        reference, control, (parameter,)
+    )
+
+    assert torch.isfinite(matched)
+    assert matched == 0
+    assert logs["control_shared_gradient_l2_match_valid"] == 0
+    assert logs["control_shared_gradient_l2_scale"] == 0
+
+
+def test_random_scale_surrogate_matches_true_event_gradient_magnitude() -> None:
+    z_full = torch.tensor([[[[1.0]]]])
+    contributions = torch.tensor(
+        [[[[2.0]], [[-80.0]], [[-2.0]], [[0.25]]]],
+        requires_grad=True,
+    )
+    target = torch.zeros_like(z_full)
+
+    loss, logs = same_pixel_random_scale_suppression(
+        z_full, contributions, target, safe_kernel=1, salt=3
+    )
+    gradient = torch.autograd.grad(loss, contributions)[0]
+
+    expected_slope = torch.sigmoid(torch.tensor(2.0))
+    torch.testing.assert_close(gradient.abs().sum(), expected_slope)
+    torch.testing.assert_close(
+        logs["selected_contribution_gradient_l2_before_scale"],
+        logs["reference_contribution_gradient_l2"],
+    )
+    assert logs["random_scale_reference_slope_surrogate"] == 1
+
+
+def test_m1_all_safe_fp_and_m2_pivotal_pixel_have_distinct_supports() -> None:
+    z_full = torch.tensor([[[[1.0, 1.0, -1.0]]]], requires_grad=True)
+    contributions = torch.zeros(1, 4, 1, 3)
+    contributions[0, 0, 0, 0] = 2.0
+    target = torch.zeros_like(z_full)
+
+    m1_loss, m1_logs = all_safe_positive_fused_suppression(
+        z_full, contributions, target, safe_kernel=1
+    )
+    m2_loss, m2_logs = same_responsible_pixel_fused_suppression(
+        z_full, contributions, target, safe_kernel=1
+    )
+
+    assert m1_logs["control_selected_count"] == 2
+    assert m2_logs["control_selected_count"] == 1
+    torch.testing.assert_close(m1_loss, torch.nn.functional.softplus(z_full[0, 0, 0, :2]).mean())
+    torch.testing.assert_close(m2_loss, torch.nn.functional.softplus(z_full[0, 0, 0, 0]))
+
+
 def test_safe_background_validates_kernel() -> None:
     target = torch.zeros(1, 1, 4, 4)
     try:
@@ -219,6 +329,110 @@ def test_safe_background_validates_kernel() -> None:
         assert "positive odd" in str(error)
     else:
         raise AssertionError("even safe kernel must be rejected")
+
+
+def test_responsibility_routing_conserves_decision_gradient_budget() -> None:
+    z_full = torch.ones(1, 1, 1, 2)
+    contributions = torch.zeros(1, 4, 1, 2, requires_grad=True)
+    with torch.no_grad():
+        contributions[0, 0, 0] = torch.tensor([2.0, 2.0])
+        contributions[0, 1, 0] = torch.tensor([3.0, 0.5])
+    target = torch.zeros_like(z_full)
+
+    loss, logs = responsibility_conserving_gradient_routing(
+        z_full, contributions, target, safe_kernel=1
+    )
+    gradient = torch.autograd.grad(loss, contributions)[0]
+    slope = torch.sigmoid(torch.tensor(1.0))
+
+    torch.testing.assert_close(loss, torch.nn.functional.softplus(torch.tensor(1.0)))
+    torch.testing.assert_close(gradient[0, 0, 0, 0], slope / 4.0)
+    torch.testing.assert_close(gradient[0, 1, 0, 0], slope / 4.0)
+    torch.testing.assert_close(gradient[0, 0, 0, 1], slope / 2.0)
+    assert gradient[0, 1, 0, 1] == 0
+    assert gradient[:, 2:].abs().sum() == 0
+    torch.testing.assert_close(
+        gradient.sum(dim=1, keepdim=True),
+        torch.full_like(z_full, slope / 2.0),
+    )
+    assert logs["responsible_count"] == 3
+    assert logs["unique_responsible_pixels"] == 2
+    assert logs["routing_weight_sum_error"] == 0
+    assert logs["responsibility_conserving_routing"] == 1
+
+
+def test_responsibility_routing_no_event_is_exact_zero() -> None:
+    z_full = -torch.ones(1, 1, 2, 2)
+    contributions = torch.randn(1, 4, 2, 2, requires_grad=True)
+    target = torch.zeros_like(z_full)
+
+    loss, logs = responsibility_conserving_gradient_routing(
+        z_full, contributions, target, safe_kernel=1
+    )
+    gradient = torch.autograd.grad(loss, contributions)[0]
+
+    assert loss == 0
+    assert torch.count_nonzero(gradient) == 0
+    assert logs["responsible_count"] == 0
+    assert logs["unique_responsible_pixels"] == 0
+
+
+def test_responsibility_routing_safe_density_scales_conserved_budget() -> None:
+    z_full = torch.ones(1, 1, 1, 2)
+    contributions = torch.zeros(1, 4, 1, 2, requires_grad=True)
+    with torch.no_grad():
+        contributions[0, 0, 0, 0] = 2.0
+    target = torch.zeros_like(z_full)
+
+    loss, logs = responsibility_conserving_gradient_routing(
+        z_full,
+        contributions,
+        target,
+        safe_kernel=1,
+        normalization="safe_density",
+    )
+    gradient = torch.autograd.grad(loss, contributions)[0]
+
+    torch.testing.assert_close(
+        loss, torch.nn.functional.softplus(torch.tensor(1.0)) / 2.0
+    )
+    torch.testing.assert_close(
+        gradient[0, 0, 0, 0], torch.sigmoid(torch.tensor(1.0)) / 2.0
+    )
+    assert gradient[..., 1].abs().sum() == 0
+    assert logs["normalization_denominator"] == 2
+    assert logs["normalization_safe_density"] == 1
+
+
+def test_responsibility_density_risk_factorizes_prevalence_and_severity() -> None:
+    z_full = torch.ones(1, 1, 1, 2)
+    contributions = torch.zeros(1, 4, 1, 2, requires_grad=True)
+    with torch.no_grad():
+        contributions[0, 0, 0, 0] = 2.0
+    target = torch.zeros_like(z_full)
+
+    loss, logs = responsibility_density_risk(
+        z_full, contributions, target, safe_kernel=1
+    )
+    legacy_loss, _ = counterfactual_responsibility_suppression(
+        z_full,
+        contributions,
+        target,
+        safe_kernel=1,
+        normalization="safe_density",
+    )
+    gradient = torch.autograd.grad(loss, contributions, retain_graph=True)[0]
+    legacy_gradient = torch.autograd.grad(legacy_loss, contributions)[0]
+
+    torch.testing.assert_close(loss, legacy_loss, rtol=0, atol=0)
+    torch.testing.assert_close(gradient, legacy_gradient, rtol=0, atol=0)
+    torch.testing.assert_close(
+        logs["responsibility_prevalence"]
+        * logs["conditional_responsibility_severity"],
+        logs["responsibility_density_factorized"],
+    )
+    assert logs["responsibility_density_factorization_error"] == 0
+    assert logs["responsibility_density_risk"] == 1
 
 
 def test_detached_scale_evidence_calibrates_only_fusion_weights() -> None:

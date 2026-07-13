@@ -20,6 +20,7 @@ def make_args(dataset_dir, **kwargs):
         train_split_file='',
         val_split_file='',
         test_split_file='',
+        evaluation_protocol='internal_holdout',
     )
     for key, value in kwargs.items():
         setattr(args, key, value)
@@ -74,6 +75,25 @@ def test_explicit_fit_val_test_manifests_are_supported(tmp_path):
     assert valset.names == val
     assert testset.names == test
     Trainer.assert_disjoint_splits(trainset, valset, testset)
+
+
+def test_official_train_test_protocol_uses_every_train_image_and_no_third_split(
+    tmp_path,
+):
+    train_names = ['train_a', 'train_b', 'train_c']
+    test_names = ['test_a', 'test_b']
+    write_split(tmp_path / 'img_idx' / ('train_%s.txt' % tmp_path.name), train_names)
+    write_split(tmp_path / 'img_idx' / ('test_%s.txt' % tmp_path.name), test_names)
+    args = make_args(tmp_path, evaluation_protocol='official_train_test')
+
+    trainset = IRSTD_Dataset(args, mode='train')
+    evaluation = IRSTD_Dataset(args, mode='val')
+    testset = IRSTD_Dataset(args, mode='test')
+
+    assert trainset.names == train_names
+    assert evaluation.names == test_names
+    assert testset.names == test_names
+    Trainer.assert_disjoint_train_test(trainset, evaluation)
 
 
 def test_overlap_audit_fails_closed():

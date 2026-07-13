@@ -48,6 +48,9 @@ def test_summarize_uses_paired_per_run_best_iou(tmp_path: Path) -> None:
     assert result["aggregate"]["paired_delta"]["IoU"]["mean"] == pytest.approx(0.1)
     assert result["aggregate"]["paired_delta"]["FA"]["mean"] == pytest.approx(-1.0)
     assert result["aggregate"]["paired_delta"]["IoU"]["positive_seeds"] == 2
+    assert result["pairs"][0]["trajectory"]["baseline"]["final_epoch"]["IoU"] == 0.6
+    assert result["pairs"][0]["trajectory_delta"]["final_epoch"]["IoU"] == pytest.approx(0.1)
+    assert result["trajectory_aggregate"]["last_20_mean"]["paired_delta"]["IoU"]["mean"] == pytest.approx(0.1)
 
 
 def test_metric_parser_rejects_incomplete_epochs(tmp_path: Path) -> None:
@@ -59,3 +62,20 @@ def test_metric_parser_rejects_incomplete_epochs(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="incomplete or non-canonical"):
         parse_metric_log(path, expected_epochs=3)
+
+
+def test_metric_parser_rejects_explicitly_invalid_run(tmp_path: Path) -> None:
+    run = tmp_path / "invalid_run"
+    run.mkdir()
+    metric = run / "epoch_metric.log"
+    metric.write_text(
+        "2026-01-01 - 0000 - IoU 0.1000 - PD 0.2000 - FA 3.0000\n",
+        encoding="utf-8",
+    )
+    (run / "INVALID_RUN.json").write_text(
+        '{"valid": false, "reason": "non-finite loss"}\n',
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="explicitly marked invalid"):
+        parse_metric_log(metric, expected_epochs=1)

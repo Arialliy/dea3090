@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import dataclasses
 import json
 import os
@@ -25,9 +26,12 @@ if str(PROJECT_ROOT) not in sys.path:
 from model.MSHNet import MSHNet as WorkbenchMSHNet
 from model.baselines.mshnet_deterministic import MSHNet as CleanMSHNet
 from model.counterfactual_responsibility import (
+    all_safe_positive_fused_suppression,
     counterfactual_responsibility_suppression,
+    match_parameter_gradient_l2,
     magnitude_matched_nonpivotal_suppression,
     same_pixel_random_scale_suppression,
+    same_responsible_pixel_fused_suppression,
 )
 from model.loss import SLSIoULoss
 from model.scale_coalition_supervision import leave_one_scale_out_coalitions
@@ -141,14 +145,17 @@ def main() -> None:
     selection_logs: dict[str, float] = {}
     active_batches_seen = 0
     model.eval()
-    with torch.inference_mode():
-        for batch_index, (images, targets) in enumerate(train_loader):
-            if batch_index >= args.max_train_batches:
-                break
-            images = images.to(device)
-            targets = targets.to(device)
+    for batch_index, (images, targets) in enumerate(train_loader):
+        if batch_index >= args.max_train_batches:
+            break
+        images = images.to(device)
+        targets = targets.to(device)
+        # A fresh clone preserves the checkpoint BN state for every scanned
+        # batch and matches the train-mode closure used in the actual branch.
+        scan_model = copy.deepcopy(model).train()
+        with torch.no_grad():
             _, masks, prediction = canonical_loss(
-                model,
+                scan_model,
                 images,
                 targets,
                 loss_function,
@@ -156,7 +163,7 @@ def main() -> None:
                 epoch=epoch,
             )
             coalition = leave_one_scale_out_coalitions(
-                masks, prediction, model.final
+                masks, prediction, scan_model.final
             )
             _, logs = counterfactual_responsibility_suppression(
                 prediction,
@@ -164,14 +171,15 @@ def main() -> None:
                 targets,
                 safe_kernel=args.safe_kernel,
             )
-            if float(logs["responsible_count"]) > 0:
-                if active_batches_seen < args.skip_active_batches:
-                    active_batches_seen += 1
-                    continue
-                selected_train = (images.detach(), targets.detach())
-                selected_batch_index = batch_index
-                selection_logs = _scalar_logs(logs)
-                break
+        del scan_model
+        if float(logs["responsible_count"]) > 0:
+            if active_batches_seen < args.skip_active_batches:
+                active_batches_seen += 1
+                continue
+            selected_train = (images.detach().clone(), targets.detach().clone())
+            selected_batch_index = batch_index
+            selection_logs = _scalar_logs(logs)
+            break
     if selected_train is None:
         raise RuntimeError(
             "no active SDRR batch found within --max-train-batches"
@@ -179,13 +187,7 @@ def main() -> None:
     probe_images, probe_targets = next(iter(val_loader))
     probe_images = probe_images.to(device)
     probe_targets = probe_targets.to(device)
-    inference_images, inference_targets = selected_train
-    # Tensors created under inference_mode cannot later be saved for backward.
-    # Copy them outside that context while preserving exact values/device.
-    train_images = torch.empty_like(inference_images)
-    train_targets = torch.empty_like(inference_targets)
-    train_images.copy_(inference_images)
-    train_targets.copy_(inference_targets)
+    train_images, train_targets = selected_train
 
     branch_logs: dict[str, dict[str, float]] = {}
 
@@ -218,6 +220,8 @@ def main() -> None:
         Callable[..., tuple[torch.Tensor, dict[str, torch.Tensor]]],
     ] = {
         "sdrr": counterfactual_responsibility_suppression,
+        "m1_all_safe_fp": all_safe_positive_fused_suppression,
+        "m2_same_pivotal_pixel_fused": same_responsible_pixel_fused_suppression,
         "m3_magnitude_nonpivotal": magnitude_matched_nonpivotal_suppression,
         "m4_same_pixel_random_scale": same_pixel_random_scale_suppression,
     }
@@ -263,12 +267,33 @@ def main() -> None:
                 train_targets,
                 **kwargs,
             )
-            branch_logs[_name] = _scalar_logs(logs)
             active_count = logs.get(
                 "control_selected_count", logs["responsible_count"]
             )
             if bool((active_count == 0).detach().cpu()):
+                branch_logs[_name] = _scalar_logs(logs)
                 return canonical
+            if _name not in ("sdrr", "m1_all_safe_fp"):
+                reference_regularization, _ = (
+                    counterfactual_responsibility_suppression(
+                        prediction,
+                        coalition["contributions"],
+                        train_targets,
+                        safe_kernel=args.safe_kernel,
+                        normalization="event",
+                    )
+                )
+                regularization, shared_logs = match_parameter_gradient_l2(
+                    reference_regularization,
+                    regularization,
+                    tuple(
+                        parameter
+                        for parameter in current.parameters()
+                        if parameter.requires_grad
+                    ),
+                )
+                logs.update(shared_logs)
+            branch_logs[_name] = _scalar_logs(logs)
             return canonical + args.sdrr_lambda * regularization
 
         result = optimizer_counterfactual(
@@ -289,7 +314,7 @@ def main() -> None:
         "val_split_sha256": val_dataset.split_sha256,
         "selected_train_batch_index": selected_batch_index,
         "skipped_active_batches": args.skip_active_batches,
-        "selection_logs_eval_mode": selection_logs,
+        "selection_logs_train_mode": selection_logs,
         "branch_logs_train_mode": branch_logs,
         "comparisons_against_canonical": results,
     }

@@ -9,13 +9,18 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from pathlib import Path
 
 import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
-from model.MSHNet import MSHNet
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from model.baselines.mshnet_deterministic import MSHNet
 from model.mshnet_evidence_view import forward_mshnet_evidence
 from utils.data import IRSTD_Dataset
 from utils.metric import PD_FA
@@ -39,6 +44,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--input-channels", type=int, default=3)
     parser.add_argument("--device", default="auto")
+    parser.add_argument("--output", type=Path)
     return parser.parse_args()
 
 
@@ -141,7 +147,11 @@ def main() -> None:
         "strict_dominators": strict_dominators,
         "rows_by_iou": sorted(rows, key=lambda row: row["iou"], reverse=True),
     }
-    print(json.dumps(report, indent=2))
+    rendered = json.dumps(report, indent=2, sort_keys=True) + "\n"
+    if args.output is not None:
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        args.output.write_text(rendered, encoding="utf-8")
+    print(rendered, end="")
 
 
 if __name__ == "__main__":

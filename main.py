@@ -10,6 +10,12 @@ from model.baselines.mshnet_deterministic import (
     MSHNet as DeterministicBaselineMSHNet,
 )
 from model.baselines.mshnet_official import MSHNet as OfficialBaselineMSHNet
+from model.sdr_mshnet import SDRMSHNet
+from model.orthogonal_scale_ownership import OSOMSHNet
+from model.deletion_stable_fusion import DSFMSHNet
+from model.decision_conditional_deletion_fusion import DCDFMSHNet
+from model.counterfactual_conflict_diffusion import CCFDMSHNet
+from model.support_persistence_transport import SupportPersistenceMSHNet
 from model.loss import *
 from model.full_dea_mshnet import FullDEAMSHNet
 from model.dea_integrated_mshnet import DEAIntegratedMSHNet
@@ -37,10 +43,15 @@ from model.scale_coalition_supervision import (
     nested_scale_filtration,
 )
 from model.counterfactual_responsibility import (
+    all_safe_positive_fused_suppression,
     counterfactual_responsibility_suppression,
     matched_random_responsibility_suppression,
+    match_parameter_gradient_l2,
     magnitude_matched_nonpivotal_suppression,
+    responsibility_conserving_gradient_routing,
+    responsibility_density_risk,
     same_pixel_random_scale_suppression,
+    same_responsible_pixel_fused_suppression,
 )
 from model.task_gradient_supervision import (
     combine_task_and_auxiliary_gradients,
@@ -93,9 +104,13 @@ COALITION_DEEP_SUPERVISION_TYPES = (
 )
 RESPONSIBILITY_DEEP_SUPERVISION_TYPES = (
     'crs_flip_suppression',
+    'crs_responsibility_density',
+    'crs_responsibility_routing',
     'crs_matched_random',
     'crs_same_pixel_random_scale',
     'crs_magnitude_nonpivotal',
+    'crs_all_safe_fp',
+    'crs_same_pixel_fused',
 )
 SCALE_SUBSET_DEEP_SUPERVISION = {
     'legacy_no_s3': (0, 1, 2),
@@ -205,6 +220,31 @@ def validate_args(args):
         args.deep_supervision = "legacy_exact"
     if args.deep_supervision == "legacy":
         args.deep_supervision = "legacy_exact"
+    fusion_regularizer_modes = {
+        "sdrr": "crs_flip_suppression",
+        "rdr": "crs_responsibility_density",
+        "rcr": "crs_responsibility_routing",
+        "m1_all_safe_fp": "crs_all_safe_fp",
+        "m2_pivotal_pixel": "crs_same_pixel_fused",
+        "m3_magnitude_nonpivotal": "crs_magnitude_nonpivotal",
+        "m4_random_scale": "crs_same_pixel_random_scale",
+        "scale_budget_random": "crs_matched_random",
+    }
+    fusion_regularizer = getattr(args, "fusion_regularizer", "none")
+    if fusion_regularizer not in ("none", *fusion_regularizer_modes):
+        raise ValueError("--fusion-regularizer has an unsupported value.")
+    if fusion_regularizer != "none":
+        mapped_mode = fusion_regularizer_modes[fusion_regularizer]
+        if args.deep_supervision not in ("legacy_exact", mapped_mode):
+            raise ValueError(
+                "--fusion-regularizer conflicts with --deep-supervision"
+            )
+        args.deep_supervision = mapped_mode
+    elif args.deep_supervision in fusion_regularizer_modes.values():
+        fusion_regularizer = {
+            mode: name for name, mode in fusion_regularizer_modes.items()
+        }[args.deep_supervision]
+    args.fusion_regularizer = fusion_regularizer
     deep_supervision_choices = (
         "legacy_exact",
         "legacy_rescaled",
@@ -238,6 +278,17 @@ def validate_args(args):
     for key, value in defaults.items():
         if not hasattr(args, key):
             setattr(args, key, value)
+    total_epochs = int(getattr(args, "epochs", 400))
+    start_ratio = getattr(args, "sdrr_start_ratio", None)
+    ramp_ratio = getattr(args, "sdrr_ramp_ratio", None)
+    if start_ratio is not None:
+        if not 0.0 <= float(start_ratio) < 1.0:
+            raise ValueError("--sdrr-start-ratio must be in [0, 1).")
+        args.crs_start_epoch = int(round(float(start_ratio) * total_epochs))
+    if ramp_ratio is not None:
+        if not 0.0 < float(ramp_ratio) <= 1.0:
+            raise ValueError("--sdrr-ramp-ratio must be in (0, 1].")
+        args.crs_ramp_epochs = max(1, int(round(float(ramp_ratio) * total_epochs)))
     if args.deep_supervision != "legacy_exact" and args.model_type != "mshnet":
         raise ValueError(
             "--deep-supervision modes other than legacy_exact are currently "
@@ -256,6 +307,8 @@ def validate_args(args):
             )
     if float(getattr(args, "aux_loss_weight", 0.8)) < 0.0:
         raise ValueError("--aux-loss-weight must be non-negative.")
+    if int(getattr(args, "evaluation_interval", 1)) < 1:
+        raise ValueError("--evaluation-interval must be >= 1.")
     if float(getattr(args, "ownership_sigma", 0.75)) <= 0.0:
         raise ValueError("--ownership-sigma must be positive.")
     if float(getattr(args, "ownership_preferred_cells", 3.0)) <= 0.0:
@@ -297,9 +350,20 @@ def validate_args(args):
             "--sdrr-normalization must be event, safe_density, or unique_pixel."
         )
     mshnet_variant = getattr(args, "mshnet_variant", "workbench")
-    if mshnet_variant not in ("workbench", "official", "deterministic"):
+    if mshnet_variant not in (
+        "workbench",
+        "official",
+        "deterministic",
+        "sdr",
+        "oso",
+        "dsf",
+        "dcdf",
+        "ccfd",
+        "spt0",
+    ):
         raise ValueError(
-            "--mshnet-variant must be workbench, official, or deterministic."
+            "--mshnet-variant must be workbench, official, deterministic, "
+            "sdr, oso, dsf, dcdf, ccfd, or spt0."
         )
     if args.model_type == "mshnet" and mshnet_variant != "workbench":
         if any(
@@ -475,7 +539,31 @@ def validate_args(args):
                 "DEA main-model training and DEA-lite losses must not be mixed."
             )
 
-    if getattr(args, "mode", "train") == "train" and not getattr(args, "val_split_file", ""):
+    evaluation_protocol = getattr(
+        args, "evaluation_protocol", "internal_holdout"
+    )
+    if evaluation_protocol not in ("internal_holdout", "official_train_test"):
+        raise ValueError("--evaluation-protocol has an unsupported value.")
+    if bool(getattr(args, "skip_final_evaluation", False)) and (
+        evaluation_protocol != "official_train_test"
+        or getattr(args, "mode", "train") != "train"
+    ):
+        raise ValueError(
+            "--skip-final-evaluation is only valid for an "
+            "official_train_test training prefix."
+        )
+    if evaluation_protocol == "official_train_test" and getattr(
+        args, "val_split_file", ""
+    ):
+        raise ValueError(
+            "--val-split-file must be empty for official_train_test; "
+            "the official test manifest is selected by --test-split-file."
+        )
+    if (
+        getattr(args, "mode", "train") == "train"
+        and evaluation_protocol == "internal_holdout"
+        and not getattr(args, "val_split_file", "")
+    ):
         val_fraction = float(getattr(args, "val_fraction", 0.2))
         if not 0.0 < val_fraction < 1.0:
             raise ValueError("--val-fraction must be strictly between 0 and 1.")
@@ -504,9 +592,13 @@ def get_method_name(args):
             "asfs_anchor_filtration": "ASFS-AnchorFiltration",
             "rdfs_continuation": "RDFS-Continuation",
             "crs_flip_suppression": "SDRR-ScaleDeletionResponsibility",
+            "crs_responsibility_density": "RDR-ResponsibilityDensityRisk",
+            "crs_responsibility_routing": "RCR-ResponsibilityConservingRouting",
             "crs_matched_random": "SDRR-ScaleBudgetRandomControl-Unmatched",
             "crs_same_pixel_random_scale": "SDRR-SamePixelRandomScaleControl",
             "crs_magnitude_nonpivotal": "SDRR-MagnitudeMatchedNonPivotalControl",
+            "crs_all_safe_fp": "SDRR-AllSafeFPControl",
+            "crs_same_pixel_fused": "SDRR-SamePivotalPixelFusedControl",
             "legacy_no_s3": "MSHNet-Control-NoS3",
             "legacy_no_s2s3": "MSHNet-Control-NoS2S3",
             "legacy_s0_only": "MSHNet-Control-S0Only",
@@ -519,6 +611,10 @@ def get_method_name(args):
             normalization = getattr(args, "sdrr_normalization", "event")
             if normalization != "event":
                 return "SDRR-NormalizationControl-" + normalization
+        if deep_supervision == "crs_responsibility_routing":
+            normalization = getattr(args, "sdrr_normalization", "event")
+            if normalization == "safe_density":
+                return "RCR-ResponsibilityConservingRouting-Density"
         return names.get(deep_supervision, "MSHNet-" + deep_supervision)
     if is_cev_control(args.model_type):
         kernel = int(getattr(args, "cev_kernel_size", 7))
@@ -579,6 +675,18 @@ def get_method_name(args):
         return "MSHNet-OfficialForward"
     if args.model_type == "mshnet" and mshnet_variant == "deterministic":
         return "MSHNet-Deterministic"
+    if args.model_type == "mshnet" and mshnet_variant == "sdr":
+        return "SDR-MSHNet"
+    if args.model_type == "mshnet" and mshnet_variant == "oso":
+        return "OSO-MSHNet"
+    if args.model_type == "mshnet" and mshnet_variant == "dsf":
+        return "DSF-MSHNet"
+    if args.model_type == "mshnet" and mshnet_variant == "dcdf":
+        return "DCDF-MSHNet"
+    if args.model_type == "mshnet" and mshnet_variant == "ccfd":
+        return "CCFD-MSHNet"
+    if args.model_type == "mshnet" and mshnet_variant == "spt0":
+        return "SPT0-MSHNet"
     return "MSHNet"
 
 def get_run_folder_name(args, timestamp=None):
@@ -591,6 +699,7 @@ def get_method_metadata(args):
     return {
         "method": get_method_name(args),
         "model_type": args.model_type,
+        "fusion_regularizer": getattr(args, "fusion_regularizer", "none"),
         "mshnet_variant": getattr(args, "mshnet_variant", "workbench"),
         "cev_kernel_size": int(getattr(args, "cev_kernel_size", 7)),
         "cev_initial_bias": float(getattr(args, "cev_initial_bias", -6.0)),
@@ -664,6 +773,13 @@ def get_method_metadata(args):
             getattr(args, "crs_detach_scale_evidence", False)
         ),
         "sdrr_normalization": getattr(args, "sdrr_normalization", "event"),
+        "sdrr_start_ratio": float(getattr(args, "crs_start_epoch", 250))
+        / float(max(1, int(getattr(args, "epochs", 400)))),
+        "sdrr_ramp_ratio": float(getattr(args, "crs_ramp_epochs", 50))
+        / float(max(1, int(getattr(args, "epochs", 400)))),
+        "sdrr_match_shared_grad_norm": bool(
+            getattr(args, "sdrr_match_shared_grad_norm", True)
+        ),
         "predictive_state_channels": int(
             getattr(args, "predictive_state_channels", 32)
         ),
@@ -701,6 +817,13 @@ def get_method_metadata(args):
         "test_split_file": getattr(args, "test_split_file", ""),
         "val_fraction": float(getattr(args, "val_fraction", 0.2)),
         "split_seed": int(getattr(args, "split_seed", getattr(args, "seed", 0))),
+        "evaluation_protocol": getattr(
+            args, "evaluation_protocol", "internal_holdout"
+        ),
+        "evaluation_interval": int(getattr(args, "evaluation_interval", 1)),
+        "skip_final_evaluation": bool(
+            getattr(args, "skip_final_evaluation", False)
+        ),
         "train_split_sha256": getattr(args, "train_split_sha256", ""),
         "val_split_sha256": getattr(args, "val_split_sha256", ""),
         "test_split_sha256": getattr(args, "test_split_sha256", ""),
@@ -722,9 +845,40 @@ def parse_args():
     parser.add_argument('--test-split-file', type=str, default='')
     parser.add_argument('--val-fraction', type=float, default=0.2)
     parser.add_argument('--split-seed', type=int, default=20260706)
+    parser.add_argument(
+        '--evaluation-protocol',
+        choices=['internal_holdout', 'official_train_test'],
+        default='internal_holdout',
+        help=(
+            'internal_holdout splits the train manifest for development; '
+            'official_train_test fits the complete train manifest and uses '
+            'the disjoint official test manifest for fixed-epoch evaluation.'
+        ),
+    )
     parser.add_argument('--batch-size', type=int, default=4)
     parser.add_argument('--num-workers', type=int, default=4)
     parser.add_argument('--epochs', type=int, default=400)
+    parser.add_argument(
+        '--evaluation-interval',
+        type=int,
+        default=1,
+        help=(
+            'Evaluate every N epochs; the final epoch is always evaluated. '
+            'Skipped epochs still save a resumable latest checkpoint.'
+        ),
+    )
+    parser.add_argument(
+        '--skip-final-evaluation',
+        type=str2bool,
+        nargs='?',
+        const=True,
+        default=False,
+        help=(
+            'Do not force evaluation at the last epoch of an '
+            'official_train_test training prefix. This is intended only for '
+            'building a shared checkpoint without reading official test data.'
+        ),
+    )
     parser.add_argument('--lr', type=float, default=0.05)
     parser.add_argument('--warm-epoch', type=int, default=5)
 
@@ -771,11 +925,16 @@ def parse_args():
     )
     parser.add_argument(
         '--mshnet-variant',
-        choices=['workbench', 'official', 'deterministic'],
+        choices=[
+            'workbench', 'official', 'deterministic', 'sdr', 'oso', 'dsf',
+            'dcdf', 'ccfd', 'spt0'
+        ],
         default='workbench',
         help=(
             'Physical MSHNet implementation: historical experiment workbench, '
-            'canonical official-forward, or parameter-identical deterministic-backward.'
+            'canonical official-forward, parameter-identical deterministic-backward, '
+            'the complete parameter-identical SDR responsibility model, or '
+            'the structurally orthogonal scale-ownership fusion model.'
         ),
     )
     parser.add_argument(
@@ -802,9 +961,13 @@ def parse_args():
             'asfs_anchor_filtration',
             'rdfs_continuation',
             'crs_flip_suppression',
+            'crs_responsibility_density',
+            'crs_responsibility_routing',
             'crs_matched_random',
             'crs_same_pixel_random_scale',
             'crs_magnitude_nonpivotal',
+            'crs_all_safe_fp',
+            'crs_same_pixel_fused',
             'legacy_no_s3',
             'legacy_no_s2s3',
             'legacy_s0_only',
@@ -814,6 +977,22 @@ def parse_args():
             'zmsls_null_abstain',
         ],
         help='Deep-supervision training topology for MSHNet.',
+    )
+    parser.add_argument(
+        '--fusion-regularizer',
+        choices=[
+            'none',
+            'sdrr',
+            'rdr',
+            'rcr',
+            'm1_all_safe_fp',
+            'm2_pivotal_pixel',
+            'm3_magnitude_nonpivotal',
+            'm4_random_scale',
+            'scale_budget_random',
+        ],
+        default='none',
+        help='Paper-facing training-only fusion regularizer or attribution control.',
     )
     parser.add_argument('--aux-loss-weight', type=float, default=0.8)
     parser.add_argument('--ownership-preferred-cells', type=float, default=3.0)
@@ -840,10 +1019,12 @@ def parse_args():
     parser.add_argument('--hms-ramp-epochs', type=int, default=20)
     parser.add_argument('--rdfs-start-epoch', type=int, default=20)
     parser.add_argument('--rdfs-ramp-epochs', type=int, default=20)
-    parser.add_argument('--crs-lambda', type=float, default=0.05)
+    parser.add_argument('--crs-lambda', '--sdrr-lambda', dest='crs_lambda', type=float, default=0.05)
     parser.add_argument('--crs-start-epoch', type=int, default=250)
     parser.add_argument('--crs-ramp-epochs', type=int, default=50)
-    parser.add_argument('--crs-safe-kernel', type=int, default=15)
+    parser.add_argument('--sdrr-start-ratio', type=float, default=None)
+    parser.add_argument('--sdrr-ramp-ratio', type=float, default=None)
+    parser.add_argument('--crs-safe-kernel', '--sdrr-safe-kernel', dest='crs_safe_kernel', type=int, default=15)
     parser.add_argument(
         '--sdrr-normalization',
         choices=['event', 'safe_density', 'unique_pixel'],
@@ -851,7 +1032,17 @@ def parse_args():
         help='Attribution control for SDRR gradient-budget normalization.',
     )
     parser.add_argument(
-        '--crs-detach-scale-evidence', type=str2bool, default=False,
+        '--sdrr-match-shared-grad-norm',
+        type=str2bool,
+        default=True,
+        help=(
+            'For attribution controls only, match the regularizer gradient L2 '
+            'over all shared MSHNet parameters to the true SDRR gradient.'
+        ),
+    )
+    parser.add_argument(
+        '--crs-detach-scale-evidence', '--sdrr-detach-scale-evidence',
+        dest='crs_detach_scale_evidence', type=str2bool, default=False,
         help=(
             'Backpropagate the responsibility term only into the native final '
             'fusion convolution; canonical segmentation gradients still train '
@@ -984,8 +1175,12 @@ class Trainer(object):
         if args.mode == 'train':
             trainset = IRSTD_Dataset(args, mode='train')
             valset = IRSTD_Dataset(args, mode='val')
-            test_reference = IRSTD_Dataset(args, mode='test')
-            self.assert_disjoint_splits(trainset, valset, test_reference)
+            if getattr(args, 'evaluation_protocol', 'internal_holdout') == 'official_train_test':
+                self.assert_disjoint_train_test(trainset, valset)
+                test_reference = valset
+            else:
+                test_reference = IRSTD_Dataset(args, mode='test')
+                self.assert_disjoint_splits(trainset, valset, test_reference)
             self.train_dataset = trainset
             setattr(args, 'train_split_sha256', trainset.split_sha256)
             setattr(args, 'val_split_sha256', valset.split_sha256)
@@ -1074,6 +1269,18 @@ class Trainer(object):
             model = OfficialBaselineMSHNet(3)
         elif args.model_type == "mshnet" and args.mshnet_variant == "deterministic":
             model = DeterministicBaselineMSHNet(3)
+        elif args.model_type == "mshnet" and args.mshnet_variant == "sdr":
+            model = SDRMSHNet(3)
+        elif args.model_type == "mshnet" and args.mshnet_variant == "oso":
+            model = OSOMSHNet(3)
+        elif args.model_type == "mshnet" and args.mshnet_variant == "dsf":
+            model = DSFMSHNet(3)
+        elif args.model_type == "mshnet" and args.mshnet_variant == "dcdf":
+            model = DCDFMSHNet(3)
+        elif args.model_type == "mshnet" and args.mshnet_variant == "ccfd":
+            model = CCFDMSHNet(3)
+        elif args.model_type == "mshnet" and args.mshnet_variant == "spt0":
+            model = SupportPersistenceMSHNet(3, active_stages=(0,))
         else:
             model = MSHNet(3)
 
@@ -1240,6 +1447,15 @@ class Trainer(object):
                     % (left, right, len(overlap), overlap[:5])
                 )
 
+    @staticmethod
+    def assert_disjoint_train_test(trainset, testset):
+        overlap = sorted(set(trainset.names).intersection(testset.names))
+        if overlap:
+            raise RuntimeError(
+                'train/test split leakage detected (%d samples), e.g. %s'
+                % (len(overlap), overlap[:5])
+            )
+
     def print_split_summary(self):
         if self.train_dataset is not None:
             print(
@@ -1250,9 +1466,16 @@ class Trainer(object):
                     self.train_dataset.split_source,
                 )
             )
+            evaluation_name = (
+                'test'
+                if getattr(self.args, 'evaluation_protocol', 'internal_holdout')
+                == 'official_train_test'
+                else 'val'
+            )
             print(
-                'split val:   n=%d sha256=%s source=%s'
+                'split %-5s n=%d sha256=%s source=%s'
                 % (
+                    evaluation_name + ':',
                     len(self.val_dataset),
                     self.val_dataset.split_sha256[:12],
                     self.val_dataset.split_source,
@@ -1271,9 +1494,15 @@ class Trainer(object):
     def persist_split_manifests(self):
         if self.mode != 'train':
             return
+        evaluation_name = (
+            'test'
+            if getattr(self.args, 'evaluation_protocol', 'internal_holdout')
+            == 'official_train_test'
+            else 'val'
+        )
         for split_name, dataset in (
             ('train', self.train_dataset),
-            ('val', self.val_dataset),
+            (evaluation_name, self.val_dataset),
         ):
             manifest_path = osp.join(self.save_folder, 'split_%s.txt' % split_name)
             with open(manifest_path, 'w') as f:
@@ -2195,21 +2424,21 @@ class Trainer(object):
                 "crs_matched_random",
                 "crs_same_pixel_random_scale",
                 "crs_magnitude_nonpivotal",
+                "crs_all_safe_fp",
+                "crs_same_pixel_fused",
             ):
                 control_salt = (
                     int(getattr(self.args, "seed", 0)) * 1_000_003
                     + int(epoch) * 9_176
                     + int(getattr(self, "current_batch_index", 0))
                 )
-                control_function = (
-                    matched_random_responsibility_suppression
-                    if mode == "crs_matched_random"
-                    else (
-                        same_pixel_random_scale_suppression
-                        if mode == "crs_same_pixel_random_scale"
-                        else magnitude_matched_nonpivotal_suppression
-                    )
-                )
+                control_function = {
+                    "crs_matched_random": matched_random_responsibility_suppression,
+                    "crs_same_pixel_random_scale": same_pixel_random_scale_suppression,
+                    "crs_magnitude_nonpivotal": magnitude_matched_nonpivotal_suppression,
+                    "crs_all_safe_fp": all_safe_positive_fused_suppression,
+                    "crs_same_pixel_fused": same_responsible_pixel_fused_suppression,
+                }[mode]
                 responsibility_loss, responsibility_log = (
                     control_function(
                         pred,
@@ -2220,10 +2449,66 @@ class Trainer(object):
                             self.args, "sdrr_normalization", "event"
                         ),
                         **(
-                            {}
-                            if mode == "crs_magnitude_nonpivotal"
-                            else {"salt": control_salt}
+                            {"salt": control_salt}
+                            if mode in (
+                                "crs_matched_random",
+                                "crs_same_pixel_random_scale",
+                            )
+                            else {}
                         ),
+                    )
+                )
+                selected_count = responsibility_log["control_selected_count"]
+                if (
+                    bool(getattr(self.args, "sdrr_match_shared_grad_norm", True))
+                    and bool((selected_count > 0).detach().cpu())
+                    and mode != "crs_all_safe_fp"
+                ):
+                    reference_loss, _ = counterfactual_responsibility_suppression(
+                        pred,
+                        coalition["contributions"],
+                        labels,
+                        safe_kernel=int(self.args.crs_safe_kernel),
+                        normalization=getattr(
+                            self.args, "sdrr_normalization", "event"
+                        ),
+                    )
+                    shared_parameters = tuple(
+                        parameter
+                        for parameter in self.model.parameters()
+                        if parameter.requires_grad
+                    )
+                    responsibility_loss, shared_gradient_logs = (
+                        match_parameter_gradient_l2(
+                            reference_loss,
+                            responsibility_loss,
+                            shared_parameters,
+                        )
+                    )
+                    responsibility_log.update(shared_gradient_logs)
+            elif mode == "crs_responsibility_routing":
+                responsibility_loss, responsibility_log = (
+                    responsibility_conserving_gradient_routing(
+                        pred,
+                        coalition["contributions"],
+                        labels,
+                        safe_kernel=int(self.args.crs_safe_kernel),
+                        normalization=(
+                            "safe_density"
+                            if getattr(
+                                self.args, "sdrr_normalization", "event"
+                            ) == "safe_density"
+                            else "unique_pixel"
+                        ),
+                    )
+                )
+            elif mode == "crs_responsibility_density":
+                responsibility_loss, responsibility_log = (
+                    responsibility_density_risk(
+                        pred,
+                        coalition["contributions"],
+                        labels,
+                        safe_kernel=int(self.args.crs_safe_kernel),
                     )
                 )
             else:
@@ -2247,6 +2532,12 @@ class Trainer(object):
                 "counterfactual_responsibility": float(
                     mode == "crs_flip_suppression"
                 ),
+                "responsibility_conserving_routing": float(
+                    mode == "crs_responsibility_routing"
+                ),
+                "responsibility_density_risk": float(
+                    mode == "crs_responsibility_density"
+                ),
                 "scale_budget_random_control": float(
                     mode == "crs_matched_random"
                 ),
@@ -2255,6 +2546,12 @@ class Trainer(object):
                 ),
                 "magnitude_matched_nonpivotal_control": float(
                     mode == "crs_magnitude_nonpivotal"
+                ),
+                "all_safe_positive_fused_control": float(
+                    mode == "crs_all_safe_fp"
+                ),
+                "same_responsible_pixel_fused_control": float(
+                    mode == "crs_same_pixel_fused"
                 ),
                 "crs_detach_scale_evidence": float(
                     bool(self.args.crs_detach_scale_evidence)
@@ -3114,6 +3411,25 @@ class Trainer(object):
             losses.update(loss.item(), pred.size(0))
             tbar.set_description('Epoch %d, loss %.4f' % (epoch, losses.avg))
     
+    def save_latest_without_evaluation(self, epoch):
+        """Persist an exact resumable state without reading evaluation data."""
+
+        latest_states = {
+            "net": self.model.state_dict(),
+            "optimizer": self.optimizer.state_dict(),
+            "epoch": epoch,
+            "iou": self.best_iou,
+            "pd": self.best_pd_fa_pd,
+            "fa": self.best_pd_fa,
+            "best_iou": self.best_iou,
+            "best_pd_fa": self.best_pd_fa,
+            "best_pd_fa_iou": self.best_pd_fa_iou,
+            "best_pd_fa_pd": self.best_pd_fa_pd,
+            "best_pd_fa_epoch": self.best_pd_fa_epoch,
+            "method_meta": get_method_metadata(self.args),
+        }
+        torch.save(latest_states, osp.join(self.save_folder, 'checkpoint.pkl'))
+
     def test(self, epoch):
         self.model.eval()
         self.mIoU.reset()
@@ -3289,7 +3605,17 @@ if __name__ == '__main__':
     if trainer.mode=='train':
         for epoch in range(trainer.start_epoch, args.epochs):
             trainer.train(epoch)
-            trainer.test(epoch)
+            should_evaluate = (
+                (epoch + 1) % int(args.evaluation_interval) == 0
+                or (
+                    epoch == args.epochs - 1
+                    and not bool(args.skip_final_evaluation)
+                )
+            )
+            if should_evaluate:
+                trainer.test(epoch)
+            else:
+                trainer.save_latest_without_evaluation(epoch)
     else:
         trainer.test(1)
  

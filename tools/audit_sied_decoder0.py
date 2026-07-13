@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -19,6 +20,10 @@ import numpy as np
 import torch
 from torch import Tensor
 from torch.utils.data import DataLoader
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 from model.dea_scale_interaction_exchange import (
     ScaleInteractionExchangeMSHNet,
@@ -47,6 +52,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--anchor-mode", choices=("zero", "mean"), default="mean")
     parser.add_argument("--ratio-eps", type=float, default=1e-6)
     parser.add_argument("--device", default="auto")
+    parser.add_argument("--output", type=Path)
     return parser.parse_args()
 
 
@@ -343,7 +349,11 @@ def main() -> None:
         "checkpoint_load_missing_allowed": sorted(allowed_missing),
         "rows": rows,
     }
-    print(json.dumps(report, indent=2, sort_keys=False))
+    rendered = json.dumps(report, indent=2, sort_keys=False) + "\n"
+    if args.output is not None:
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        args.output.write_text(rendered, encoding="utf-8")
+    print(rendered, end="")
 
 
 if __name__ == "__main__":

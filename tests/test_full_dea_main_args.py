@@ -82,6 +82,20 @@ def test_full_dea_rejects_invalid_safe_kernel() -> None:
         validate_args(args)
 
 
+def test_skip_final_evaluation_is_restricted_to_official_training_prefix() -> None:
+    with pytest.raises(ValueError, match="official_train_test training prefix"):
+        validate_args(make_args(skip_final_evaluation=True))
+
+    args = validate_args(
+        make_args(
+            evaluation_protocol="official_train_test",
+            mode="train",
+            skip_final_evaluation=True,
+        )
+    )
+    assert args.skip_final_evaluation is True
+
+
 def test_method_metadata_names_full_dea_v3() -> None:
     args = validate_args(make_args(model_type="full_dea"))
     assert get_method_name(args) == "FullDEA-v3-TPS"
@@ -277,6 +291,7 @@ def test_crs_persists_counterfactual_constraint_semantics() -> None:
     assert metadata["crs_safe_kernel"] == 15
     assert metadata["crs_detach_scale_evidence"] is True
     assert metadata["sdrr_normalization"] == "event"
+    assert metadata["sdrr_match_shared_grad_norm"] is True
 
     with pytest.raises(ValueError, match="crs-safe-kernel"):
         validate_args(make_args(
@@ -320,6 +335,107 @@ def test_crs_matched_random_is_explicit_ablation_not_main_method() -> None:
     assert metadata["crs_start_epoch"] == 250
 
 
+def test_responsibility_conserving_routing_is_paper_facing_method() -> None:
+    args = validate_args(
+        make_args(
+            deep_supervision="legacy_exact",
+            fusion_regularizer="rcr",
+            epochs=120,
+            sdrr_start_ratio=2 / 3,
+            sdrr_ramp_ratio=1 / 6,
+        )
+    )
+
+    assert args.deep_supervision == "crs_responsibility_routing"
+    assert args.crs_start_epoch == 80
+    assert args.crs_ramp_epochs == 20
+    assert get_method_name(args) == "RCR-ResponsibilityConservingRouting"
+
+    density = validate_args(
+        make_args(
+            deep_supervision="legacy_exact",
+            fusion_regularizer="rcr",
+            sdrr_normalization="safe_density",
+        )
+    )
+    assert get_method_name(density) == (
+        "RCR-ResponsibilityConservingRouting-Density"
+    )
+
+
+def test_responsibility_density_risk_is_final_single_objective() -> None:
+    args = validate_args(
+        make_args(
+            deep_supervision="legacy_exact",
+            fusion_regularizer="rdr",
+        )
+    )
+
+    assert args.deep_supervision == "crs_responsibility_density"
+    assert get_method_name(args) == "RDR-ResponsibilityDensityRisk"
+
+
+def test_oso_is_a_structural_mshnet_variant() -> None:
+    args = validate_args(
+        make_args(
+            mshnet_variant="oso",
+            deep_supervision="legacy_exact",
+            fusion_regularizer="none",
+        )
+    )
+    assert args.mshnet_variant == "oso"
+    assert get_method_name(args) == "OSO-MSHNet"
+
+
+def test_dsf_is_a_structural_mshnet_variant() -> None:
+    args = validate_args(
+        make_args(
+            mshnet_variant="dsf",
+            deep_supervision="legacy_exact",
+            fusion_regularizer="none",
+        )
+    )
+    assert args.mshnet_variant == "dsf"
+    assert get_method_name(args) == "DSF-MSHNet"
+
+
+def test_dcdf_is_a_structural_mshnet_variant() -> None:
+    args = validate_args(
+        make_args(
+            mshnet_variant="dcdf",
+            deep_supervision="legacy_exact",
+            fusion_regularizer="none",
+        )
+    )
+    assert args.mshnet_variant == "dcdf"
+    assert get_method_name(args) == "DCDF-MSHNet"
+
+
+def test_ccfd_is_a_structural_mshnet_variant() -> None:
+    args = validate_args(
+        make_args(
+            mshnet_variant="ccfd",
+            deep_supervision="legacy_exact",
+            fusion_regularizer="none",
+        )
+    )
+    assert args.mshnet_variant == "ccfd"
+    assert get_method_name(args) == "CCFD-MSHNet"
+
+
+def test_spt0_is_a_structural_mshnet_variant() -> None:
+    args = validate_args(
+        make_args(
+            mshnet_variant="spt0",
+            deep_supervision="legacy_exact",
+        )
+    )
+    assert args.mshnet_variant == "spt0"
+    assert get_method_name(args) == "SPT0-MSHNet"
+
+
+
+
 def test_same_pixel_random_scale_control_is_explicit() -> None:
     args = validate_args(
         make_args(deep_supervision="crs_same_pixel_random_scale")
@@ -335,6 +451,50 @@ def test_magnitude_nonpivotal_control_is_explicit() -> None:
         == "SDRR-MagnitudeMatchedNonPivotalControl"
     )
     assert args.return_instance_map is False
+
+
+@pytest.mark.parametrize(
+    ("mode", "name"),
+    [
+        ("crs_all_safe_fp", "SDRR-AllSafeFPControl"),
+        ("crs_same_pixel_fused", "SDRR-SamePivotalPixelFusedControl"),
+    ],
+)
+def test_fused_hard_negative_controls_are_explicit(mode: str, name: str) -> None:
+    args = validate_args(make_args(deep_supervision=mode))
+    assert get_method_name(args) == name
+    assert args.return_instance_map is False
+
+
+def test_paper_facing_fusion_regularizer_maps_relative_schedule() -> None:
+    args = validate_args(
+        make_args(
+            deep_supervision="legacy_exact",
+            fusion_regularizer="sdrr",
+            epochs=400,
+            sdrr_start_ratio=0.625,
+            sdrr_ramp_ratio=0.125,
+        )
+    )
+
+    assert args.deep_supervision == "crs_flip_suppression"
+    assert args.fusion_regularizer == "sdrr"
+    assert args.crs_start_epoch == 250
+    assert args.crs_ramp_epochs == 50
+    metadata = get_method_metadata(args)
+    assert metadata["fusion_regularizer"] == "sdrr"
+    assert metadata["sdrr_start_ratio"] == 0.625
+    assert metadata["sdrr_ramp_ratio"] == 0.125
+
+
+def test_fusion_regularizer_rejects_conflicting_legacy_switch() -> None:
+    with pytest.raises(ValueError, match="conflicts"):
+        validate_args(
+            make_args(
+                deep_supervision="crs_same_pixel_fused",
+                fusion_regularizer="sdrr",
+            )
+        )
 
 
 def test_clean_mshnet_variants_are_physically_explicit() -> None:

@@ -22,7 +22,14 @@ class IRSTD_Dataset(Data.Dataset):
 
         dataset_dir = args.dataset_dir
 
-        if mode in ('train', 'val'):
+        evaluation_protocol = getattr(
+            args, 'evaluation_protocol', 'internal_holdout'
+        )
+        official_test_as_eval = (
+            evaluation_protocol == 'official_train_test' and mode == 'val'
+        )
+
+        if mode in ('train', 'val') and not official_test_as_eval:
             txtfile = 'trainval.txt'
             split_prefix = 'train'
         else:
@@ -31,7 +38,7 @@ class IRSTD_Dataset(Data.Dataset):
 
         split_override = (
             getattr(args, 'train_split_file', '')
-            if mode in ('train', 'val')
+            if mode in ('train', 'val') and not official_test_as_eval
             else getattr(args, 'test_split_file', '')
         )
         self.list_dir = self._resolve_split_file(
@@ -42,7 +49,13 @@ class IRSTD_Dataset(Data.Dataset):
 
         source_names = self._read_names(self.list_dir)
         self.split_source = self.list_dir
-        if mode in ('train', 'val'):
+        if evaluation_protocol == 'official_train_test':
+            # The benchmark exposes only disjoint train/test manifests.  Use
+            # every listed training image for fitting and the official test
+            # manifest for fixed-epoch evaluation; never synthesize a third
+            # split or silently remove training images.
+            self.names = source_names
+        elif mode in ('train', 'val'):
             train_names, val_names = self._split_train_validation(
                 source_names,
                 mode=mode,

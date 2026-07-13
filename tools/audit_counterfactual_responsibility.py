@@ -15,7 +15,7 @@ from model.MSHNet import MSHNet
 from model.counterfactual_responsibility import build_safe_background
 from model.mshnet_evidence_view import forward_mshnet_evidence
 from utils.data import IRSTD_Dataset
-from utils.metric import PD_FA
+from utils.metric import PD_FA, match_connected_components
 
 
 def parse_args() -> argparse.Namespace:
@@ -84,6 +84,17 @@ def main() -> None:
     responsible_deleted_margin_sum = torch.zeros(4, dtype=torch.float64)
     active_images = 0
     reconstruction_error = 0.0
+    predicted_components = 0
+    false_alarm_components = 0
+    matched_components = 0
+    false_alarm_components_with_responsibility = 0
+    matched_components_with_responsibility = 0
+    responsible_pixels_in_false_alarm_components = 0
+    responsible_pixels_in_matched_components = 0
+    responsible_events_in_false_alarm_components = 0
+    responsible_events_in_matched_components = 0
+    event_component_rows = []
+    image_offset = 0
 
     with torch.no_grad():
         for images, targets in loader:
@@ -112,6 +123,59 @@ def main() -> None:
                 & safe.expand_as(contributions)
             )
             responsible_union = responsible.any(dim=1, keepdim=True)
+
+            prediction_np = positive[:, 0].detach().cpu().numpy()
+            target_np = target_binary[:, 0].detach().cpu().numpy()
+            responsible_np = responsible.detach().cpu().numpy()
+            responsible_union_np = responsible_union[:, 0].detach().cpu().numpy()
+            for batch_index in range(images.shape[0]):
+                component_match = match_connected_components(
+                    prediction_np[batch_index], target_np[batch_index]
+                )
+                matched_indices = {
+                    prediction_index
+                    for _, prediction_index, _ in component_match.matches
+                }
+                false_indices = set(component_match.unmatched_prediction_indices)
+                predicted_components += len(component_match.prediction_regions)
+                false_alarm_components += len(false_indices)
+                matched_components += len(matched_indices)
+                for component_index, region in enumerate(
+                    component_match.prediction_regions
+                ):
+                    component_mask = (
+                        component_match.prediction_label_map == region.label
+                    )
+                    event_pixels = int(
+                        responsible_union_np[batch_index][component_mask].sum()
+                    )
+                    event_count = int(
+                        responsible_np[batch_index, :, component_mask].sum()
+                    )
+                    if event_pixels == 0:
+                        continue
+                    is_false_alarm = component_index in false_indices
+                    if is_false_alarm:
+                        false_alarm_components_with_responsibility += 1
+                        responsible_pixels_in_false_alarm_components += event_pixels
+                        responsible_events_in_false_alarm_components += event_count
+                    else:
+                        matched_components_with_responsibility += 1
+                        responsible_pixels_in_matched_components += event_pixels
+                        responsible_events_in_matched_components += event_count
+                    event_component_rows.append(
+                        {
+                            "image_index": image_offset + batch_index,
+                            "image_name": dataset.names[image_offset + batch_index],
+                            "component_index": component_index,
+                            "is_false_alarm": is_false_alarm,
+                            "area": int(region.area),
+                            "centroid_yx": [float(value) for value in region.centroid],
+                            "responsible_pixels": event_pixels,
+                            "responsible_events": event_count,
+                        }
+                    )
+            image_offset += images.shape[0]
 
             total_pixels += targets.numel()
             safe_pixels += int(safe.sum())
@@ -204,6 +268,38 @@ def main() -> None:
         },
         "operating_curve": operating_curve,
         "scales": scale_rows,
+        "component_linkage": {
+            "predicted_components": predicted_components,
+            "false_alarm_components": false_alarm_components,
+            "matched_components": matched_components,
+            "false_alarm_components_with_responsibility": (
+                false_alarm_components_with_responsibility
+            ),
+            "matched_components_with_responsibility": (
+                matched_components_with_responsibility
+            ),
+            "responsible_pixels_in_false_alarm_components": (
+                responsible_pixels_in_false_alarm_components
+            ),
+            "responsible_pixels_in_matched_components": (
+                responsible_pixels_in_matched_components
+            ),
+            "responsible_events_in_false_alarm_components": (
+                responsible_events_in_false_alarm_components
+            ),
+            "responsible_events_in_matched_components": (
+                responsible_events_in_matched_components
+            ),
+            "false_alarm_component_event_coverage": divide(
+                false_alarm_components_with_responsibility,
+                false_alarm_components,
+            ),
+            "responsible_pixel_false_alarm_precision": divide(
+                responsible_pixels_in_false_alarm_components,
+                responsible_pixel_union,
+            ),
+            "event_components": event_component_rows,
+        },
     }
     print(json.dumps(report, indent=2, allow_nan=False))
 
