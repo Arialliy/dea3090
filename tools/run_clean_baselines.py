@@ -22,6 +22,19 @@ import time
 
 PROJECT_DIR = Path(__file__).resolve().parents[1]
 DATASET_NAMES = ("NUAA-SIRST", "NUDT-SIRST", "IRSTD-1K")
+CANONICAL_SOURCE_COMMIT = "46cdfd46802629da51f70124662af7335be74b56"
+CANONICAL_EVALUATION_INTERVAL = 10
+CANONICAL_PROTOCOL = {
+    "model_type": "mshnet",
+    "mshnet_variant": "deterministic",
+    "evaluation_protocol": "internal_holdout",
+    "deep_supervision": "legacy_exact",
+    "fusion_regularizer": "none",
+    "deterministic": True,
+    "evaluation_interval": CANONICAL_EVALUATION_INTERVAL,
+    "skip_final_evaluation": False,
+    "checkpoint_resume": False,
+}
 
 
 def parse_csv(text: str, cast):
@@ -54,19 +67,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--val-fraction", type=float, default=0.2)
     parser.add_argument("--epochs", type=int, default=400)
     parser.add_argument("--batch-size", type=int, default=4)
-    parser.add_argument("--num-workers", type=int, default=4)
+    parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--lr", type=float, default=0.05)
     parser.add_argument("--warm-epoch", type=int, default=5)
-    parser.add_argument(
-        "--deterministic", choices=("true", "false"), default="true"
-    )
     parser.add_argument(
         "--batch-id",
         default="clean_baseline_holdout_v1",
         help="Stable id used below weight/clean and repro_runs/clean.",
     )
     parser.add_argument(
-        "--resume", action="store_true", help="Resume jobs that contain checkpoint.pkl."
+        "--resume",
+        action="store_true",
+        help=(
+            "Reserved for a future exact-resume implementation. The current "
+            "formal runner rejects it because checkpoints do not preserve all "
+            "RNG and DataLoader state."
+        ),
     )
     parser.add_argument("--dry-run", action="store_true")
     return parser.parse_args()
@@ -146,6 +162,32 @@ def write_json(path: Path, payload: object) -> None:
     temporary.replace(path)
 
 
+def install_manifest(path: Path, payload: object, *, dry_run: bool) -> None:
+    """Install new evidence without allowing dry-runs to mutate a batch."""
+
+    if dry_run:
+        return
+    if path.exists():
+        raise FileExistsError(
+            f"batch already exists: {path}; use a fresh --batch-id"
+        )
+    write_json(path, payload)
+
+
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def repository_head() -> str:
+    return subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], cwd=PROJECT_DIR, text=True
+    ).strip()
+
+
 def build_command(args: argparse.Namespace, job: dict) -> list[str]:
     run_dir = Path(job["run_dir"])
     command = [
@@ -153,13 +195,19 @@ def build_command(args: argparse.Namespace, job: dict) -> list[str]:
         str(PROJECT_DIR / "main.py"),
         "--mode", "train",
         "--model-type", "mshnet",
+        "--mshnet-variant", "deterministic",
+        "--evaluation-protocol", "internal_holdout",
+        "--deep-supervision", "legacy_exact",
+        "--fusion-regularizer", "none",
+        "--evaluation-interval", str(CANONICAL_EVALUATION_INTERVAL),
+        "--skip-final-evaluation", "false",
         "--dataset-dir", job["dataset_dir"],
         "--train-split-file", job["train_file"],
         "--test-split-file", job["test_file"],
         "--val-fraction", str(args.val_fraction),
         "--split-seed", str(args.split_seed),
         "--seed", str(job["seed"]),
-        "--deterministic", args.deterministic,
+        "--deterministic", "true",
         "--epochs", str(args.epochs),
         "--batch-size", str(args.batch_size),
         "--num-workers", str(args.num_workers),
@@ -168,16 +216,17 @@ def build_command(args: argparse.Namespace, job: dict) -> list[str]:
         "--run-dir", str(run_dir),
         "--run-label", job["job_id"],
     ]
-    checkpoint = run_dir / "checkpoint.pkl"
-    if args.resume and checkpoint.is_file():
-        command.extend(
-            ["--if-checkpoint", "true", "--checkpoint-dir", str(run_dir)]
-        )
     return command
 
 
 def main() -> int:
     args = parse_args()
+    if args.resume:
+        raise RuntimeError(
+            "Formal clean baselines must start at epoch 0: exact resume is "
+            "disabled because current checkpoints do not preserve all RNG and "
+            "DataLoader state. Use a fresh --batch-id."
+        )
     datasets = parse_csv(args.datasets, str)
     seeds = parse_csv(args.seeds, int)
     gpus = parse_csv(args.gpus, int)
@@ -220,16 +269,24 @@ def main() -> int:
         "created_at": dt.datetime.now(dt.timezone.utc).isoformat(),
         "stage": "development_holdout_baseline",
         "official_test_policy": "loaded only for disjoint/hash audit; not iterated",
+        "canonical_source_commit": CANONICAL_SOURCE_COMMIT,
+        "canonical_protocol": CANONICAL_PROTOCOL,
+        "provenance": {
+            "repository_head": repository_head(),
+            "canonical_official_sha256": file_sha256(
+                PROJECT_DIR / "model" / "baselines" / "mshnet_official.py"
+            ),
+            "canonical_deterministic_sha256": file_sha256(
+                PROJECT_DIR / "model" / "baselines" / "mshnet_deterministic.py"
+            ),
+            "training_entrypoint_sha256": file_sha256(PROJECT_DIR / "main.py"),
+        },
         "args": vars(args),
         "datasets": dataset_meta,
         "jobs": jobs,
     }
     manifest_path = report_root / "manifest.json"
-    if manifest_path.exists() and not args.resume and not args.dry_run:
-        raise FileExistsError(
-            f"batch already exists: {manifest_path}; pass --resume or use a new --batch-id"
-        )
-    write_json(manifest_path, manifest)
+    install_manifest(manifest_path, manifest, dry_run=args.dry_run)
 
     pending = []
     for job in jobs:
@@ -260,7 +317,11 @@ def main() -> int:
             log_handle = log_path.open("a", encoding="utf-8", buffering=1)
             env = os.environ.copy()
             env["CUDA_VISIBLE_DEVICES"] = str(gpu)
+            env["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
+            env["PYTHONHASHSEED"] = str(job["seed"])
             env["PYTHONUNBUFFERED"] = "1"
+            env["OMP_NUM_THREADS"] = "1"
+            env["MKL_NUM_THREADS"] = "1"
             started_at = dt.datetime.now(dt.timezone.utc).isoformat()
             process = subprocess.Popen(
                 job["command"],

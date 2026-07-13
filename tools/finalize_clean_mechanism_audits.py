@@ -28,7 +28,9 @@ if str(PROJECT_DIR) not in sys.path:
 from tools.finalize_clean_baselines import (
     DATASET_NAMES,
     EXPECTED_EPOCHS,
+    EXPECTED_EVALUATION_INTERVAL,
     FinalizationError,
+    expected_evaluation_epochs,
     load_checkpoint_cpu,
     normalized_path,
     parse_metrics,
@@ -54,6 +56,8 @@ EXPECTED_BASELINE_COMPLETION = (
     "all_3x3_jobs_400_epochs_returncode_0_and_finalizer_validated"
 )
 EXPECTED_CHECKPOINT_ROLE = "best_iou"
+EXPECTED_BASELINE_METHOD = "MSHNet-Deterministic"
+EXPECTED_BASELINE_VARIANT = "deterministic"
 EXPECTED_SPLIT_ROLE = "val"
 EXPECTED_METHOD = "mshnet"
 EXPECTED_ANCHOR_MODE = "mean"
@@ -613,13 +617,17 @@ def _validate_baseline(
         "clean baseline summary",
     )
     expected_header = {
+        "schema_version": 1,
         "batch_id": batch_dir.name,
         "status": "complete_and_validated",
-        "method": "mshnet",
+        "method": EXPECTED_BASELINE_METHOD,
         "model_type": "mshnet",
+        "mshnet_variant": EXPECTED_BASELINE_VARIANT,
         "official_test_status": "untouched; not evaluated by this finalizer",
         "not_for_official_test_or_main_table_claims": True,
         "epochs_per_run": EXPECTED_EPOCHS,
+        "evaluation_interval": EXPECTED_EVALUATION_INTERVAL,
+        "evaluated_checkpoints_per_run": len(expected_evaluation_epochs()),
         "seeds": seeds,
     }
     mismatches = [
@@ -682,12 +690,11 @@ def _validate_baseline(
             validate_result(result, job)
             run_dir = normalized_path(job.get("run_dir"), f"baseline job {dataset}/{seed}.run_dir")
             rows = parse_metrics(run_dir / "epoch_metric.log")
-            if len(rows) != EXPECTED_EPOCHS or [row["epoch"] for row in rows] != list(
-                range(EXPECTED_EPOCHS)
-            ):
+            expected_epochs = expected_evaluation_epochs()
+            if [row["epoch"] for row in rows] != expected_epochs:
                 raise FinalizationError(
-                    f"baseline {dataset}/{seed} must contain exactly epochs "
-                    f"0..{EXPECTED_EPOCHS - 1}"
+                    f"baseline {dataset}/{seed} metric rows must match the frozen "
+                    f"{EXPECTED_EVALUATION_INTERVAL}-epoch evaluation cadence"
                 )
             checkpoint_path = run_dir / "checkpoint_best_iou.pkl"
             checkpoint = checkpoint_loader(checkpoint_path)

@@ -8,7 +8,13 @@ import sys
 import numpy as np
 import pytest
 
-from tools.finalize_clean_baselines import DATASET_NAMES, EXPECTED_EPOCHS
+from tools.finalize_clean_baselines import (
+    DATASET_NAMES,
+    EXPECTED_CANONICAL_PROTOCOL,
+    EXPECTED_CANONICAL_SOURCE_COMMIT,
+    EXPECTED_EPOCHS,
+    expected_evaluation_epochs,
+)
 from tools import run_clean_mechanism_audits as runner
 
 
@@ -57,7 +63,7 @@ def make_finalized_batch(tmp_path: Path):
             best_pd = 0.95 + seed_index * 0.001
             best_fa = 10.0 - dataset_index - seed_index * 0.1
             lines = []
-            for epoch in range(EXPECTED_EPOCHS):
+            for epoch in expected_evaluation_epochs():
                 iou = best_iou - (EXPECTED_EPOCHS - 1 - epoch) * 0.0001
                 pd = best_pd if epoch == EXPECTED_EPOCHS - 1 else best_pd - 0.01
                 fa = best_fa if epoch == EXPECTED_EPOCHS - 1 else best_fa + 1.0
@@ -71,6 +77,13 @@ def make_finalized_batch(tmp_path: Path):
 
             command = [
                 "python", "main.py", "--mode", "train", "--model-type", "mshnet",
+                "--mshnet-variant", "deterministic",
+                "--evaluation-protocol", "internal_holdout",
+                "--deep-supervision", "legacy_exact",
+                "--fusion-regularizer", "none",
+                "--deterministic", "true",
+                "--evaluation-interval", "10",
+                "--skip-final-evaluation", "false",
                 "--epochs", str(EXPECTED_EPOCHS), "--seed", str(seed),
                 "--run-label", job_id, "--run-dir", str(run_dir),
             ]
@@ -101,8 +114,19 @@ def make_finalized_batch(tmp_path: Path):
                 "fa": np.float64(best_fa),
                 "best_iou": np.float64(best_iou),
                 "method_meta": {
-                    "method": "MSHNet",
+                    "method": "MSHNet-Deterministic",
                     "model_type": "mshnet",
+                    "mshnet_variant": "deterministic",
+                    "evaluation_protocol": "internal_holdout",
+                    "deep_supervision": "legacy_exact",
+                    "fusion_regularizer": "none",
+                    "deterministic": True,
+                    "evaluation_interval": 10,
+                    "skip_final_evaluation": False,
+                    "init_from_baseline": "",
+                    "dea_lambda_single": 0.0,
+                    "dea_lambda_dec": 0.0,
+                    "dea_lambda_empty": 0.0,
                     "seed": seed,
                     "run_label": job_id,
                     "split_seed": split_seed,
@@ -118,7 +142,13 @@ def make_finalized_batch(tmp_path: Path):
                     "args": {
                         "mode": "train",
                         "model_type": "mshnet",
+                        "mshnet_variant": "deterministic",
+                        "evaluation_protocol": "internal_holdout",
+                        "deep_supervision": "legacy_exact",
+                        "fusion_regularizer": "none",
                         "deterministic": True,
+                        "evaluation_interval": 10,
+                        "skip_final_evaluation": False,
                         "pin_memory": True,
                         "epochs": EXPECTED_EPOCHS,
                         "lr": 0.05,
@@ -139,6 +169,14 @@ def make_finalized_batch(tmp_path: Path):
                         "crop_size": 256,
                         "batch_size": 4,
                         "num_workers": 4,
+                        "if_checkpoint": False,
+                        "checkpoint_dir": "",
+                        "reset_optimizer": False,
+                        "init_from_baseline": "",
+                        "origin_baseline_checkpoint": "",
+                        "dea_lambda_single": 0.0,
+                        "dea_lambda_dec": 0.0,
+                        "dea_lambda_empty": 0.0,
                     }
                 },
             )
@@ -165,6 +203,8 @@ def make_finalized_batch(tmp_path: Path):
         "batch_id": batch_dir.name,
         "stage": "development_holdout_baseline",
         "official_test_policy": "loaded only for disjoint/hash audit; not iterated",
+        "canonical_source_commit": EXPECTED_CANONICAL_SOURCE_COMMIT,
+        "canonical_protocol": EXPECTED_CANONICAL_PROTOCOL,
         "args": {
             "datasets": ",".join(DATASET_NAMES),
             "seeds": ",".join(str(seed) for seed in SEEDS),
@@ -176,6 +216,7 @@ def make_finalized_batch(tmp_path: Path):
             "val_fraction": 0.2,
             "split_seed": split_seed,
             "deterministic": "true",
+            "resume": False,
         },
         "datasets": datasets_meta,
         "jobs": jobs,
@@ -185,11 +226,14 @@ def make_finalized_batch(tmp_path: Path):
         "schema_version": 1,
         "batch_id": batch_dir.name,
         "status": "complete_and_validated",
-        "method": "mshnet",
+        "method": "MSHNet-Deterministic",
         "model_type": "mshnet",
+        "mshnet_variant": "deterministic",
         "official_test_status": "untouched; not evaluated by this finalizer",
         "not_for_official_test_or_main_table_claims": True,
         "epochs_per_run": EXPECTED_EPOCHS,
+        "evaluation_interval": 10,
+        "evaluated_checkpoints_per_run": len(expected_evaluation_epochs()),
         "seeds": list(SEEDS),
         "datasets": summary_datasets,
     }
@@ -400,6 +444,21 @@ def test_safe_resume_verifies_result_and_every_array(tmp_path: Path) -> None:
     array_path.write_bytes(b"tampered")
     with pytest.raises(runner.AuditBatchError, match="array integrity mismatch"):
         runner.classify_jobs(jobs, resume=True)
+
+
+def test_rejects_noncanonical_baseline_evaluation_cadence(tmp_path: Path) -> None:
+    batch_dir, loader = make_finalized_batch(tmp_path)
+    manifest = json.loads((batch_dir / "manifest.json").read_text(encoding="utf-8"))
+    metric_log = Path(manifest["jobs"][0]["run_dir"]) / "epoch_metric.log"
+    lines = metric_log.read_text(encoding="utf-8").splitlines()
+    lines[0] = lines[0].replace(" - 0009", " - 0008")
+    metric_log.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    with pytest.raises(
+        runner.AuditBatchError,
+        match="frozen 10-epoch evaluation cadence",
+    ):
+        runner.load_validated_baseline_jobs(batch_dir, checkpoint_loader=loader)
 
 
 def test_refuses_partial_or_unrequested_nonempty_outputs(tmp_path: Path) -> None:

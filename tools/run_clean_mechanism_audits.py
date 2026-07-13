@@ -31,8 +31,10 @@ if str(PROJECT_DIR) not in sys.path:
 from tools.finalize_clean_baselines import (  # noqa: E402
     DATASET_NAMES,
     EXPECTED_EPOCHS,
+    EXPECTED_EVALUATION_INTERVAL,
     OUTPUT_JSON as BASELINE_SUMMARY_JSON,
     FinalizationError,
+    expected_evaluation_epochs,
     load_checkpoint_cpu,
     normalized_path,
     parse_metrics,
@@ -82,6 +84,8 @@ FROZEN_BASELINE_RECIPE = {
     "deterministic": "true",
 }
 GRID_COMPLETION = "all_3x3_jobs_400_epochs_returncode_0_and_finalizer_validated"
+EXPECTED_BASELINE_METHOD = "MSHNet-Deterministic"
+EXPECTED_BASELINE_VARIANT = "deterministic"
 
 
 class AuditBatchError(RuntimeError):
@@ -181,11 +185,14 @@ def _validate_summary_header(
         "schema_version": 1,
         "batch_id": batch_id,
         "status": "complete_and_validated",
-        "method": "mshnet",
+        "method": EXPECTED_BASELINE_METHOD,
         "model_type": "mshnet",
+        "mshnet_variant": EXPECTED_BASELINE_VARIANT,
         "official_test_status": "untouched; not evaluated by this finalizer",
         "not_for_official_test_or_main_table_claims": True,
         "epochs_per_run": EXPECTED_EPOCHS,
+        "evaluation_interval": EXPECTED_EVALUATION_INTERVAL,
+        "evaluated_checkpoints_per_run": len(expected_evaluation_epochs()),
         "seeds": seeds,
     }
     mismatches = [
@@ -216,7 +223,13 @@ def _validate_run_config(
     required_exact = {
         "mode": "train",
         "model_type": "mshnet",
+        "mshnet_variant": EXPECTED_BASELINE_VARIANT,
+        "evaluation_protocol": "internal_holdout",
+        "deep_supervision": "legacy_exact",
+        "fusion_regularizer": "none",
         "deterministic": True,
+        "evaluation_interval": EXPECTED_EVALUATION_INTERVAL,
+        "skip_final_evaluation": False,
         "pin_memory": True,
         "epochs": EXPECTED_EPOCHS,
         "base_size": 256,
@@ -234,6 +247,14 @@ def _validate_run_config(
         "train_split_sha256": dataset_meta.get("fit_sha256"),
         "val_split_sha256": dataset_meta.get("val_sha256"),
         "test_split_sha256": dataset_meta.get("official_test_sha256"),
+        "if_checkpoint": False,
+        "checkpoint_dir": "",
+        "reset_optimizer": False,
+        "init_from_baseline": "",
+        "origin_baseline_checkpoint": "",
+        "dea_lambda_single": 0.0,
+        "dea_lambda_dec": 0.0,
+        "dea_lambda_empty": 0.0,
     }
     mismatches = [
         f"{key}: run_config={args.get(key)!r} expected={value!r}"
@@ -351,11 +372,11 @@ def load_validated_baseline_jobs(
                 rows = parse_metrics(run_dir / "epoch_metric.log")
             except FinalizationError as exc:
                 raise AuditBatchError(str(exc)) from exc
-            if len(rows) != EXPECTED_EPOCHS or [row["epoch"] for row in rows] != list(
-                range(EXPECTED_EPOCHS)
-            ):
+            expected_epochs = expected_evaluation_epochs()
+            if [row["epoch"] for row in rows] != expected_epochs:
                 raise AuditBatchError(
-                    f"{job['job_id']} must contain exactly epochs 0..{EXPECTED_EPOCHS - 1}"
+                    f"{job['job_id']} metric rows must match the frozen "
+                    f"{EXPECTED_EVALUATION_INTERVAL}-epoch evaluation cadence"
                 )
             checkpoint_path = run_dir / CHECKPOINT_NAME
             checkpoint = checkpoint_loader(checkpoint_path)

@@ -7,13 +7,13 @@ sequence of counterfactual scale/fusion/resampling interventions. Historical
 candidates are retained as auditable negative evidence instead of being
 presented as validated improvements.
 
-> **Authoritative status (2026-07-13):** SDRR, OSO, DSF, DCDF, and CCFD are
-> mechanism studies or rejected comparators. CCFD reduced false-alarm area but
-> did not beat the independently selected canonical best-IoU checkpoint. SPT0,
-> a parameter-free support-persistence replacement at the first 2×2 max-pooling
-> boundary, has also completed its 400-epoch paired gate: it lowered FA but
-> lost IoU and PD and is therefore `DESIGN FAIL`. No structural method currently
-> has `DESIGN PASS` status.
+> **Authoritative status (2026-07-13):** TRACE Stage 0 is formally `NO-GO`:
+> the real multi-component/augmented labels do not belong to the proposed exact
+> component state family, while a semantically complete explicit frontier state
+> is not runnable at 256×256 under the frozen constraints. JIP is retained only
+> as a historical, code-level candidate. The newer CSL/JCSL/JCPT/RTFE/SNLT/BCSF
+> files are isolated research prototypes and audits, not validated models or
+> registered paper variants. No method currently has `DESIGN PASS` status.
 
 The project is based on the CVPR 2024 MSHNet implementation:
 
@@ -23,10 +23,34 @@ The project is based on the CVPR 2024 MSHNet implementation:
 
 ![Overview](assert/overview.png)
 
-## Current Gate Result
+## Current Stage-0 Decision
 
-The fixed NUAA-SIRST official train/test protocol compares each run at its own
-best-IoU checkpoint:
+TRACE cannot proceed to solver implementation without changing the task-level
+contract. The audited labels contain multiple connected components, empty crops,
+multi-run components, holes, and augmentation-induced splits. The predefined
+single-component/single-row-run family therefore cannot define an exact NLL for
+the actual supervision stream. Fixed non-overlapping partitions are also ruled
+out by the audited augmentation support. Approximate inference, dense-mask CRFs,
+or adaptive/overlapping instance protocols would be new task assumptions and
+must not be introduced silently.
+
+The clean deterministic baseline contract has completed three fresh 400-epoch
+NUAA internal-holdout runs:
+
+| Seed | Internal-val best epoch | IoU | PD | FA/Mpixel |
+| ---: | ---: | ---: | ---: | ---: |
+| 20260711 | 359 | 0.680293 | 0.981481 | 61.745 |
+| 20260712 | 129 | 0.674387 | 0.944444 | 39.744 |
+| 20260713 | 389 | 0.707264 | 0.981481 | 50.744 |
+| Mean ± sample SD | 292.33 ± 142.24 | 0.687315 ± 0.017527 | 0.969136 ± 0.021383 | 50.744 ± 11.001 |
+
+These are development-validation results, not official-test results and not a
+paper main table.
+
+## Historical Structural Comparator Results
+
+The earlier NUAA-SIRST official train/test workbench compared each run at its
+own best-IoU checkpoint:
 
 | Variant | Best epoch | IoU | PD | FA/Mpixel |
 | --- | ---: | ---: | ---: | ---: |
@@ -37,34 +61,37 @@ best-IoU checkpoint:
 CCFD and SPT0 improve false-alarm area but fail the primary IoU gate; SPT0 also
 loses PD. Their raw-logit component FROC behavior is mixed rather than
 consistently better across budgets, so both are retained as negative structural
-comparators, not proposed models.
+comparators, not proposed models. These test-selected historical results are
+mechanism evidence only under the current leakage-safe development protocol.
 
 ## Current Research Tracks
 
-- **Latest completed candidate — SPT0:** replaces only the first native max-pooling
-  boundary with a parameter-free support-persistence law derived from
-  strongest-site deletion and cross-channel spatial agreement; the full gate
-  failed despite a large FA reduction.
-- **Baseline and protocol integrity:** physically isolated official-forward and
-  deterministic-backward MSHNet variants; dataset-pair, manifest-hash,
-  state-dict, forward, backward, and shared-prefix audits.
-- **Independent checkpoint selection:** each run selects its own best-IoU point
-  from the same fixed evaluation schedule; same-epoch snapshots are diagnostic
-  only and cannot decide a method gate.
-- **Component-aware evaluation:** raw-logit component FROC, FP components per
-  image, target-instance detection probability, and pixel IoU/PD/FA.
-- **Historical structural comparators:** SDRR/RDR, OSO, DSF, DCDF, and CCFD are
-  retained with their controls and failure evidence; none is the current
-  accepted model.
-- **Earlier supervision controls:** DEA-lite, RODS, TCDS/TFDS, task-gradient,
-  scale-coalition, subset, delayed-scale, homotopy, and null-target variants.
-- **Cross-backbone infrastructure:** additive-fusion audit and a paired UIU-Net
-  runner for future transfer checks; smoke completion is not performance proof.
+- **TRACE Stage-0 contract audit:** exact component-state semantics, real-label
+  support, augmentation closure, fixed-partition feasibility, and explicit
+  frontier-state complexity are audited before any solver implementation.
+- **Clean baseline provenance:** the official-forward and parameter-identical
+  deterministic-backward variants are checked against the historical source,
+  runtime environment, data bytes, split hashes, checkpoints, and metric logs.
+- **Historical JIP candidate:** Jackknife Influence Pooling remains a documented
+  code-level hypothesis only; it has no empirical design pass and is not the
+  current frozen model.
+- **Isolated front-end prototypes:** CSL, JCSL, JCPT, RTFE, SNLT, and BCSF test
+  sufficient-statistic, geometric, or filtration ideas without being silently
+  promoted into the main CLI or paper claim.
+- **Fail-closed evaluation:** independent-best comparison, component FROC,
+  runtime attestation, baseline finalization, and mechanism summaries reject
+  incomplete schedules, provenance drift, leakage, or incompatible metrics.
+- **Historical structural comparators:** SDRR/RDR, OSO, DSF, DCDF, CCFD, and
+  SPT0 are retained with their controls and negative evidence.
+- **Cross-backbone infrastructure:** additive-fusion and paired UIU-Net tools
+  remain transfer infrastructure; smoke completion is not performance proof.
 
-The design history, negative-result ledger, and data protocol are documented in
+The current TRACE task-contract decision and reproduction evidence are in
+[`TRACE_MSHNet_STAGE0_audit.md`](TRACE_MSHNet_STAGE0_audit.md).
+The historical JIP candidate and its frozen claim boundary are in
+[`MSHNet_AAAI27_JIP_model_design.md`](MSHNet_AAAI27_JIP_model_design.md).
+The broader structural design history and negative-result ledger are in
 [`MSHNet_AAAI27_SDRR_model_design.md`](MSHNet_AAAI27_SDRR_model_design.md).
-The completed SPT0 result above supersedes that document's earlier
-run-in-progress sentence in section 33.4.
 The detailed SDRR code/submission review is retained in
 [`MSHNet_SDRR_第三轮代码与投稿复核.md`](MSHNet_SDRR_第三轮代码与投稿复核.md).
 The preceding TCDS/TFDS review is retained in
@@ -91,6 +118,13 @@ A reproducible related-work snapshot is available under
 │   ├── deletion_stable_fusion.py
 │   ├── decision_conditional_deletion_fusion.py
 │   ├── counterfactual_conflict_diffusion.py
+│   ├── baseline_embedded_resnet.py
+│   ├── counterfactual_sufficient_lift.py
+│   ├── jet_coherent_sufficient_lift.py
+│   ├── jet_coherent_potential_transport.py
+│   ├── relative_trace_free_energy_lift.py
+│   ├── scale_normalized_tangent_lift.py
+│   ├── birth_constrained_scale_filtration.py
 │   ├── loss.py
 │   ├── partial_sls_loss.py
 │   ├── resolution_owned_supervision.py
@@ -109,11 +143,20 @@ A reproducible related-work snapshot is available under
 │   ├── audit_mshnet_stage_component_trace.py
 │   ├── audit_pool_counterfactual.py
 │   ├── audit_spt_mechanism.py
+│   ├── audit_augmentation_partition_closure.py
+│   ├── audit_csl_stage0.py
+│   ├── audit_front_evidence_screen.py
+│   ├── audit_trace_component_space.py
+│   ├── audit_trace_fixed_partition.py
+│   ├── audit_trace_slicing_families.py
+│   ├── capture_trace_stage0_runtime_attestation.py
+│   ├── finalize_trace_stage0_baseline.py
 │   ├── branch_sdrr_shared_prefix.py
 │   ├── compare_independent_best.py
 │   ├── evaluate_component_froc.py
 │   ├── summarize_sdrr_formal.py
-│   └── optimizer_counterfactual.py
+│   ├── optimizer_counterfactual.py
+│   └── run_jcpt_gain_gate.py
 ├── tests/
 │   └── test_*.py
 ├── utils/
@@ -165,6 +208,9 @@ Select a physical architecture with `--mshnet-variant`:
 
 Presence in the CLI means a variant is reproducible, not that it passed the
 scientific or submission gate.
+JIP, CSL, JCSL, JCPT, RTFE, SNLT, and BCSF are not accepted
+`--mshnet-variant` values in `main.py`; their standalone files and audit
+tools must not be mistaken for integrated or empirically accepted models.
 
 ## Training-Only Fusion Regularizers
 
@@ -183,7 +229,7 @@ The historical `crs_*` deep-supervision names remain compatibility aliases.
 ## Dataset
 
 Datasets live under `datasets/` locally and are intentionally ignored by Git.
-The current paper-facing protocol uses only the published train/test manifests:
+Published train/test manifests are:
 
 | Dataset | Train manifest | Train images | Test manifest | Test images |
 | --- | --- | ---: | --- | ---: |
@@ -191,10 +237,15 @@ The current paper-facing protocol uses only the published train/test manifests:
 | NUDT-SIRST | `img_idx/train_NUDT-SIRST.txt` | 663 | `img_idx/test_NUDT-SIRST.txt` | 664 |
 | IRSTD-1K | `img_idx/train_IRSTD-1K.txt` | 800 | `img_idx/test_IRSTD-1K.txt` | 201 |
 
-Use `--evaluation-protocol official_train_test` with explicit train and test
-manifests. Internal-holdout runs remain useful for diagnostics but cannot enter
-the final comparison table. Dataset-pair integrity and manifest hashes can be
-checked with `tools/audit_dataset_pair_integrity.py`.
+The current Stage-0 development contract splits the official training manifest
+80/20 with `split_seed=20260711`, uses only internal validation for checkpoint
+selection, and sets `--evaluation-protocol internal_holdout`. The baseline
+runner reads official-test IDs only for hash/overlap checks and does not iterate
+test images or masks. A separate task-definition audit has read test masks for
+descriptive statistics, so the repository must not claim that official test is
+globally sealed. The historical `official_train_test` mode remains available
+only for reproducing earlier comparator runs. Dataset-pair integrity and hashes
+can be checked with `tools/audit_dataset_pair_integrity.py`.
 
 ## Training
 
@@ -222,23 +273,27 @@ python main.py \
   --gpu-ids 0,1,2,3
 ```
 
-Reproducible NUAA-SIRST canonical baseline:
+Reproducible NUAA-SIRST internal-holdout canonical baseline:
 
 ```bash
 python main.py \
   --dataset-dir datasets/NUAA-SIRST \
   --train-split-file img_idx/train_NUAA-SIRST.txt \
   --test-split-file img_idx/test_NUAA-SIRST.txt \
-  --evaluation-protocol official_train_test \
+  --evaluation-protocol internal_holdout \
+  --val-fraction 0.2 \
+  --split-seed 20260711 \
   --evaluation-interval 10 \
+  --num-workers 0 \
   --mode train \
   --model-type mshnet \
   --mshnet-variant deterministic \
   --deep-supervision legacy_exact \
+  --fusion-regularizer none \
   --epochs 400 \
   --seed 20260713 \
   --deterministic true \
-  --run-label official-nuaa-baseline-seed-20260713
+  --run-label trace-stage0-baseline-seed-20260713
 ```
 
 To reproduce a deep-supervision control, change only `--deep-supervision` and its
@@ -307,31 +362,42 @@ Run the unit and invariant tests with:
 python -m pytest -q
 ```
 
-The test suite covers clean-baseline identity, deterministic-backward behavior,
-direct zero-channel deletion, decision-margin stability, responsibility
-normalization, matched-control gradient support, shared-prefix branching,
-exact canonical gradients when no responsibility event exists, formal summary
-fail-closed checks, projection identities, coalition reconstruction, one-step
-optimizer counterfactuals, dataset splits, and metrics.
+The test suite covers historical-source provenance, clean-baseline identity,
+deterministic backward, runtime/data attestation, TRACE component-space and
+augmentation-closure proofs, fixed-partition and slicing audits, fail-closed
+baseline finalization, independent checkpoint comparison, component FROC,
+prototype operator/model invariants, historical SDRR controls, dataset splits,
+and metrics.
 
-Key SDRR audit entry points are:
+Current TRACE contract and baseline audits:
+
+```bash
+python tools/audit_dataset_pair_integrity.py --help
+python tools/audit_augmentation_partition_closure.py --help
+python tools/audit_trace_component_space.py --help
+python tools/audit_trace_fixed_partition.py --help
+python tools/audit_trace_slicing_families.py --help
+python tools/capture_trace_stage0_runtime_attestation.py --help
+python tools/finalize_trace_stage0_baseline.py --help
+```
+
+Current standalone prototype and evaluation audits:
+
+```bash
+python tools/audit_csl_stage0.py --help
+python tools/audit_front_evidence_screen.py --help
+python tools/run_jcpt_gain_gate.py --help
+python tools/evaluate_component_froc.py --help
+python tools/compare_independent_best.py --help
+```
+
+Historical SDRR audit entry points:
 
 ```bash
 python tools/audit_sdrr_deletion_stability.py --help
 python tools/audit_sdrr_optimizer_influence.py --help
 python tools/branch_sdrr_shared_prefix.py --help
 python tools/summarize_sdrr_formal.py --help
-```
-
-Current structural and evaluation audits include:
-
-```bash
-python tools/audit_dataset_pair_integrity.py --help
-python tools/audit_mshnet_stage_component_trace.py --help
-python tools/audit_pool_counterfactual.py --help
-python tools/audit_spt_mechanism.py --help
-python tools/evaluate_component_froc.py --help
-python tools/compare_independent_best.py --help
 ```
 
 Evaluate a trained checkpoint with:

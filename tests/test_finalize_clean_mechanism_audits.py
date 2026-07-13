@@ -9,7 +9,10 @@ import pytest
 
 from tools.finalize_clean_baselines import (
     DATASET_NAMES,
+    EXPECTED_CANONICAL_PROTOCOL,
+    EXPECTED_CANONICAL_SOURCE_COMMIT,
     EXPECTED_EPOCHS,
+    expected_evaluation_epochs,
     finalize_batch as finalize_baselines,
 )
 from tools.finalize_clean_mechanism_audits import (
@@ -82,7 +85,7 @@ def make_baseline(tmp_path: Path):
             checkpoint_path = run_dir / "checkpoint_best_iou.pkl"
             checkpoint_path.write_bytes(f"checkpoint:{dataset}:{seed}".encode())
             lines = []
-            for epoch in range(EXPECTED_EPOCHS):
+            for epoch in expected_evaluation_epochs():
                 iou = 1 / 3 if epoch == EXPECTED_EPOCHS - 1 else 0.25
                 pd = 0.5
                 fa = 250000.0
@@ -101,6 +104,20 @@ def make_baseline(tmp_path: Path):
                 "train",
                 "--model-type",
                 "mshnet",
+                "--mshnet-variant",
+                "deterministic",
+                "--evaluation-protocol",
+                "internal_holdout",
+                "--deep-supervision",
+                "legacy_exact",
+                "--fusion-regularizer",
+                "none",
+                "--deterministic",
+                "true",
+                "--evaluation-interval",
+                "10",
+                "--skip-final-evaluation",
+                "false",
                 "--epochs",
                 str(EXPECTED_EPOCHS),
                 "--seed",
@@ -136,8 +153,19 @@ def make_baseline(tmp_path: Path):
                 "fa": np.float64(250000.0),
                 "best_iou": np.float64(1 / 3),
                 "method_meta": {
-                    "method": "MSHNet",
+                    "method": "MSHNet-Deterministic",
                     "model_type": "mshnet",
+                    "mshnet_variant": "deterministic",
+                    "evaluation_protocol": "internal_holdout",
+                    "deep_supervision": "legacy_exact",
+                    "fusion_regularizer": "none",
+                    "deterministic": True,
+                    "evaluation_interval": 10,
+                    "skip_final_evaluation": False,
+                    "init_from_baseline": "",
+                    "dea_lambda_single": 0.0,
+                    "dea_lambda_dec": 0.0,
+                    "dea_lambda_empty": 0.0,
                     "seed": seed,
                     "run_label": job_id,
                     "split_seed": 77,
@@ -153,11 +181,14 @@ def make_baseline(tmp_path: Path):
             "batch_id": batch_dir.name,
             "stage": "development_holdout_baseline",
             "official_test_policy": "loaded only for disjoint/hash audit; not iterated",
+            "canonical_source_commit": EXPECTED_CANONICAL_SOURCE_COMMIT,
+            "canonical_protocol": EXPECTED_CANONICAL_PROTOCOL,
             "args": {
                 "datasets": ",".join(DATASET_NAMES),
                 "seeds": ",".join(str(seed) for seed in SEEDS),
                 "epochs": EXPECTED_EPOCHS,
                 "split_seed": 77,
+                "resume": False,
             },
             "datasets": datasets,
             "jobs": jobs,
@@ -525,6 +556,23 @@ def test_finalize_fails_closed_on_source_provenance_mismatch(tmp_path: Path) -> 
     write_json(audit_manifest, payload)
 
     with pytest.raises(FinalizationError, match="source hashes disagree"):
+        finalize_audits(batch_dir, audit_root=audit_root, checkpoint_loader=loader)
+
+    assert not (audit_root / OUTPUT_JSON).exists()
+    assert not (audit_root / OUTPUT_MARKDOWN).exists()
+
+
+def test_finalize_fails_closed_on_noncanonical_baseline_evaluation_cadence(
+    tmp_path: Path,
+) -> None:
+    batch_dir, audit_root, loader = make_complete_grid(tmp_path)
+    manifest = json.loads((batch_dir / "manifest.json").read_text(encoding="utf-8"))
+    metric_log = Path(manifest["jobs"][0]["run_dir"]) / "epoch_metric.log"
+    lines = metric_log.read_text(encoding="utf-8").splitlines()
+    lines[0] = lines[0].replace(" - 0009", " - 0008")
+    metric_log.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    with pytest.raises(FinalizationError, match="frozen 10-epoch evaluation cadence"):
         finalize_audits(batch_dir, audit_root=audit_root, checkpoint_loader=loader)
 
     assert not (audit_root / OUTPUT_JSON).exists()

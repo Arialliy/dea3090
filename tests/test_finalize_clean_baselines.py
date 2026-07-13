@@ -10,10 +10,13 @@ import torch
 
 from tools.finalize_clean_baselines import (
     DATASET_NAMES,
+    EXPECTED_CANONICAL_PROTOCOL,
+    EXPECTED_CANONICAL_SOURCE_COMMIT,
     EXPECTED_EPOCHS,
     FinalizationError,
     OUTPUT_JSON,
     OUTPUT_MARKDOWN,
+    expected_evaluation_epochs,
     finalize_batch,
     load_checkpoint_cpu,
 )
@@ -55,7 +58,7 @@ def make_complete_batch(tmp_path: Path):
             best_pd = 0.9500 + seed_index * 0.0010
             best_fa = 10.0 - dataset_index - seed_index * 0.1
             lines = []
-            for epoch in range(EXPECTED_EPOCHS):
+            for epoch in expected_evaluation_epochs():
                 iou = best_iou - (EXPECTED_EPOCHS - 1 - epoch) * 0.0001
                 pd = best_pd if epoch == EXPECTED_EPOCHS - 1 else best_pd - 0.01
                 fa = best_fa if epoch == EXPECTED_EPOCHS - 1 else best_fa + 1.0
@@ -74,6 +77,20 @@ def make_complete_batch(tmp_path: Path):
                 "train",
                 "--model-type",
                 "mshnet",
+                "--mshnet-variant",
+                "deterministic",
+                "--evaluation-protocol",
+                "internal_holdout",
+                "--deep-supervision",
+                "legacy_exact",
+                "--fusion-regularizer",
+                "none",
+                "--deterministic",
+                "true",
+                "--evaluation-interval",
+                "10",
+                "--skip-final-evaluation",
+                "false",
                 "--epochs",
                 str(EXPECTED_EPOCHS),
                 "--seed",
@@ -107,8 +124,19 @@ def make_complete_batch(tmp_path: Path):
                 "fa": np.float64(best_fa),
                 "best_iou": np.float64(best_iou),
                 "method_meta": {
-                    "method": "MSHNet",
+                    "method": "MSHNet-Deterministic",
                     "model_type": "mshnet",
+                    "mshnet_variant": "deterministic",
+                    "evaluation_protocol": "internal_holdout",
+                    "deep_supervision": "legacy_exact",
+                    "fusion_regularizer": "none",
+                    "deterministic": True,
+                    "evaluation_interval": 10,
+                    "skip_final_evaluation": False,
+                    "init_from_baseline": "",
+                    "dea_lambda_single": 0.0,
+                    "dea_lambda_dec": 0.0,
+                    "dea_lambda_empty": 0.0,
                     "seed": seed,
                     "run_label": job_id,
                     "split_seed": 77,
@@ -122,11 +150,14 @@ def make_complete_batch(tmp_path: Path):
         "batch_id": batch_dir.name,
         "stage": "development_holdout_baseline",
         "official_test_policy": "loaded only for disjoint/hash audit; not iterated",
+        "canonical_source_commit": EXPECTED_CANONICAL_SOURCE_COMMIT,
+        "canonical_protocol": EXPECTED_CANONICAL_PROTOCOL,
         "args": {
             "datasets": ",".join(DATASET_NAMES),
             "seeds": ",".join(str(seed) for seed in SEEDS),
             "epochs": EXPECTED_EPOCHS,
             "split_seed": 77,
+            "resume": False,
         },
         "datasets": dataset_meta,
         "jobs": jobs,
@@ -167,6 +198,43 @@ def test_finalize_fails_closed_on_checkpoint_identity_mismatch(tmp_path):
 
     assert not (batch_dir / OUTPUT_JSON).exists()
     assert not (batch_dir / OUTPUT_MARKDOWN).exists()
+
+
+def test_finalize_fails_closed_on_noncanonical_manifest_protocol(tmp_path):
+    batch_dir, _, checkpoint_loader = make_complete_batch(tmp_path)
+    manifest_path = batch_dir / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["canonical_protocol"]["mshnet_variant"] = "workbench"
+    write_json(manifest_path, manifest)
+
+    with pytest.raises(FinalizationError, match="canonical_protocol"):
+        finalize_batch(batch_dir, checkpoint_loader=checkpoint_loader)
+
+
+def test_finalize_fails_closed_on_resume_flag(tmp_path):
+    batch_dir, _, checkpoint_loader = make_complete_batch(tmp_path)
+    manifest = json.loads((batch_dir / "manifest.json").read_text(encoding="utf-8"))
+    result_path = Path(manifest["jobs"][0]["result_file"])
+    result = json.loads(result_path.read_text(encoding="utf-8"))
+    result["command"].extend(["--if-checkpoint", "true"])
+    write_json(result_path, result)
+
+    with pytest.raises(FinalizationError, match="forbidden continuation"):
+        finalize_batch(batch_dir, checkpoint_loader=checkpoint_loader)
+
+
+def test_finalize_fails_closed_on_wrong_evaluation_cadence(tmp_path):
+    batch_dir, _, checkpoint_loader = make_complete_batch(tmp_path)
+    manifest = json.loads((batch_dir / "manifest.json").read_text(encoding="utf-8"))
+    first_run = Path(manifest["jobs"][0]["run_dir"])
+    lines = (first_run / "epoch_metric.log").read_text(encoding="utf-8").splitlines()
+    lines[0] = lines[0].replace(" - 0009", " - 0000")
+    (first_run / "epoch_metric.log").write_text(
+        "\n".join(lines) + "\n", encoding="utf-8"
+    )
+
+    with pytest.raises(FinalizationError, match="frozen evaluation cadence"):
+        finalize_batch(batch_dir, checkpoint_loader=checkpoint_loader)
 
 
 def test_safe_checkpoint_loader_maps_tensors_to_cpu(tmp_path):

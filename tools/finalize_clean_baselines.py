@@ -27,6 +27,25 @@ OUTPUT_JSON = "clean_baseline_holdout_summary.json"
 OUTPUT_MARKDOWN = "clean_baseline_holdout_summary.md"
 EXPECTED_STAGE = "development_holdout_baseline"
 EXPECTED_TEST_POLICY = "loaded only for disjoint/hash audit; not iterated"
+EXPECTED_CANONICAL_SOURCE_COMMIT = "46cdfd46802629da51f70124662af7335be74b56"
+EXPECTED_EVALUATION_INTERVAL = 10
+EXPECTED_CANONICAL_PROTOCOL = {
+    "model_type": "mshnet",
+    "mshnet_variant": "deterministic",
+    "evaluation_protocol": "internal_holdout",
+    "deep_supervision": "legacy_exact",
+    "fusion_regularizer": "none",
+    "deterministic": True,
+    "evaluation_interval": EXPECTED_EVALUATION_INTERVAL,
+    "skip_final_evaluation": False,
+    "checkpoint_resume": False,
+}
+FORBIDDEN_COMMAND_FLAGS = {
+    "--if-checkpoint",
+    "--checkpoint-dir",
+    "--reset-optimizer",
+    "--init-from-baseline",
+}
 
 FLOAT_PATTERN = r"(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?"
 METRIC_RE = re.compile(
@@ -75,6 +94,12 @@ def require_mapping(value: Any, label: str) -> dict[str, Any]:
 def require_exact_int(value: Any, label: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int):
         raise FinalizationError(f"{label} must be an integer, got {value!r}")
+    return value
+
+
+def require_exact_bool(value: Any, label: str) -> bool:
+    if not isinstance(value, bool):
+        raise FinalizationError(f"{label} must be a boolean, got {value!r}")
     return value
 
 
@@ -192,10 +217,37 @@ def load_checkpoint_cpu(path: Path) -> dict[str, Any]:
 def command_flag(command: Any, flag: str, label: str) -> str:
     if not isinstance(command, list) or not all(isinstance(item, str) for item in command):
         raise FinalizationError(f"{label}.command must be a list of strings")
-    positions = [index for index, item in enumerate(command) if item == flag]
-    if len(positions) != 1 or positions[0] + 1 >= len(command):
+    values = []
+    prefix = flag + "="
+    for index, item in enumerate(command):
+        if item == flag:
+            if index + 1 >= len(command):
+                raise FinalizationError(f"{label}.command has no value for {flag}")
+            values.append(command[index + 1])
+        elif item.startswith(prefix):
+            values.append(item[len(prefix):])
+    if len(values) != 1:
         raise FinalizationError(f"{label}.command must contain exactly one {flag}")
-    return command[positions[0] + 1]
+    return values[0]
+
+
+def command_contains_flag(command: Any, flag: str, label: str) -> bool:
+    if not isinstance(command, list) or not all(isinstance(item, str) for item in command):
+        raise FinalizationError(f"{label}.command must be a list of strings")
+    prefix = flag + "="
+    return any(item == flag or item.startswith(prefix) for item in command)
+
+
+def expected_evaluation_epochs(
+    epochs: int = EXPECTED_EPOCHS,
+    interval: int = EXPECTED_EVALUATION_INTERVAL,
+) -> list[int]:
+    if epochs < 1 or interval < 1:
+        raise ValueError("epochs and interval must be positive")
+    epoch_ids = list(range(interval - 1, epochs, interval))
+    if epochs - 1 not in epoch_ids:
+        epoch_ids.append(epochs - 1)
+    return epoch_ids
 
 
 def normalized_path(value: Any, label: str) -> Path:
@@ -220,6 +272,13 @@ def validate_result(result: dict[str, Any], job: dict[str, Any]) -> None:
     expected_flags = {
         "--mode": "train",
         "--model-type": "mshnet",
+        "--mshnet-variant": "deterministic",
+        "--evaluation-protocol": "internal_holdout",
+        "--deep-supervision": "legacy_exact",
+        "--fusion-regularizer": "none",
+        "--deterministic": "true",
+        "--evaluation-interval": str(EXPECTED_EVALUATION_INTERVAL),
+        "--skip-final-evaluation": "false",
         "--epochs": str(EXPECTED_EPOCHS),
         "--seed": str(job["seed"]),
         "--run-label": job["job_id"],
@@ -236,6 +295,15 @@ def validate_result(result: dict[str, Any], job: dict[str, Any]) -> None:
             raise FinalizationError(
                 f"{label}.command {flag} mismatch: {actual!r} != {expected!r}"
             )
+    forbidden = sorted(
+        flag
+        for flag in FORBIDDEN_COMMAND_FLAGS
+        if command_contains_flag(command, flag, label)
+    )
+    if forbidden:
+        raise FinalizationError(
+            f"{label}.command contains forbidden continuation/init flags: {forbidden}"
+        )
 
 
 def validate_checkpoint(
@@ -247,13 +315,33 @@ def validate_checkpoint(
 ) -> dict[str, float | int]:
     label = f"checkpoint {job['job_id']}"
     metadata = require_mapping(checkpoint.get("method_meta"), f"{label}.method_meta")
-    method = metadata.get("method")
-    if not isinstance(method, str) or method.casefold() != "mshnet":
-        raise FinalizationError(f"{label} method must be MSHNet/mshnet, got {method!r}")
-    if metadata.get("model_type") != "mshnet":
-        raise FinalizationError(
-            f"{label} model_type must be 'mshnet', got {metadata.get('model_type')!r}"
-        )
+    expected_metadata = {
+        "method": "MSHNet-Deterministic",
+        "model_type": "mshnet",
+        "mshnet_variant": "deterministic",
+        "evaluation_protocol": "internal_holdout",
+        "deep_supervision": "legacy_exact",
+        "fusion_regularizer": "none",
+        "evaluation_interval": EXPECTED_EVALUATION_INTERVAL,
+        "init_from_baseline": "",
+    }
+    for key, expected in expected_metadata.items():
+        if metadata.get(key) != expected:
+            raise FinalizationError(
+                f"{label} {key} must be {expected!r}, got {metadata.get(key)!r}"
+            )
+    for key, expected in {
+        "deterministic": True,
+        "skip_final_evaluation": False,
+    }.items():
+        actual = require_exact_bool(metadata.get(key), f"{label}.{key}")
+        if actual is not expected:
+            raise FinalizationError(
+                f"{label} {key} must be {expected!r}, got {actual!r}"
+            )
+    for key in ("dea_lambda_single", "dea_lambda_dec", "dea_lambda_empty"):
+        if require_number(metadata.get(key), f"{label}.{key}") != 0.0:
+            raise FinalizationError(f"{label} {key} must be exactly zero")
     if require_exact_int(metadata.get("seed"), f"{label}.seed") != job["seed"]:
         raise FinalizationError(f"{label} seed does not match manifest job")
     if metadata.get("run_label") != job["job_id"]:
@@ -297,7 +385,12 @@ def validate_checkpoint(
     if not math.isclose(best_iou, iou, rel_tol=0.0, abs_tol=1e-12):
         raise FinalizationError(f"{label}.best_iou disagrees with checkpoint IoU")
 
-    row = rows[epoch]
+    rows_by_epoch = {int(item["epoch"]): item for item in rows}
+    if len(rows_by_epoch) != len(rows):
+        raise FinalizationError(f"{label} metric log contains duplicate epoch ids")
+    if epoch not in rows_by_epoch:
+        raise FinalizationError(f"{label}.epoch was not a scheduled evaluation epoch")
+    row = rows_by_epoch[epoch]
     checkpoint_metrics = {"iou": iou, "pd": pd, "fa": fa}
     for metric, checkpoint_value in checkpoint_metrics.items():
         logged_value = float(row[metric])
@@ -336,8 +429,21 @@ def validate_manifest(manifest: dict[str, Any], batch_dir: Path) -> tuple[list[i
         raise FinalizationError(
             "manifest official_test_policy does not certify audit-only, non-iterated test handling"
         )
+    if manifest.get("canonical_source_commit") != EXPECTED_CANONICAL_SOURCE_COMMIT:
+        raise FinalizationError(
+            "manifest canonical_source_commit does not match the frozen MSHNet source"
+        )
+    protocol = require_mapping(
+        manifest.get("canonical_protocol"), "manifest.canonical_protocol"
+    )
+    if protocol != EXPECTED_CANONICAL_PROTOCOL:
+        raise FinalizationError(
+            "manifest.canonical_protocol must exactly match the frozen protocol"
+        )
 
     args = require_mapping(manifest.get("args"), "manifest.args")
+    if require_exact_bool(args.get("resume"), "manifest.args.resume"):
+        raise FinalizationError("manifest must declare resume=false")
     if require_exact_int(args.get("epochs"), "manifest.args.epochs") != EXPECTED_EPOCHS:
         raise FinalizationError(f"manifest must declare exactly {EXPECTED_EPOCHS} epochs")
     datasets_from_args = parse_csv_field(args.get("datasets"), str, "manifest.args.datasets")
@@ -403,7 +509,9 @@ def build_markdown(summary: dict[str, Any]) -> str:
         f"- Batch: `{summary['batch_id']}`",
         f"- Validated grid: {len(DATASET_NAMES)} datasets × {len(summary['seeds'])} seeds",
         f"- Epochs per run: {summary['epochs_per_run']}",
-        "- Selection: best development-holdout IoU checkpoint within each fixed 400-epoch run",
+        f"- Evaluation cadence: every {summary['evaluation_interval']} epochs "
+        f"({summary['evaluated_checkpoints_per_run']} frozen evaluation points per run)",
+        "- Selection: best development-holdout IoU checkpoint over the frozen evaluation points",
         "- Aggregate dispersion: sample standard deviation across three seeds (n−1 denominator)",
         "- FA/M: unmatched predicted foreground pixels per million image pixels at threshold 0.5",
         "",
@@ -496,15 +604,16 @@ def finalize_batch(
 
         run_dir = normalized_path(job["run_dir"], f"manifest job {job['job_id']}.run_dir")
         rows = parse_metrics(run_dir / "epoch_metric.log")
-        if len(rows) != EXPECTED_EPOCHS:
+        expected_epochs = expected_evaluation_epochs()
+        if len(rows) != len(expected_epochs):
             raise FinalizationError(
-                f"{job['job_id']} must contain exactly {EXPECTED_EPOCHS} metric rows; "
+                f"{job['job_id']} must contain exactly {len(expected_epochs)} metric rows; "
                 f"found {len(rows)}"
             )
         epoch_ids = [int(row["epoch"]) for row in rows]
-        if epoch_ids != list(range(EXPECTED_EPOCHS)):
+        if epoch_ids != expected_epochs:
             raise FinalizationError(
-                f"{job['job_id']} epoch ids must be exactly 0..{EXPECTED_EPOCHS - 1}"
+                f"{job['job_id']} epoch ids must match the frozen evaluation cadence"
             )
 
         checkpoint_path = run_dir / "checkpoint_best_iou.pkl"
@@ -543,12 +652,15 @@ def finalize_batch(
         "batch_id": manifest["batch_id"],
         "validated_at_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
         "status": "complete_and_validated",
-        "method": "mshnet",
+        "method": "MSHNet-Deterministic",
         "model_type": "mshnet",
+        "mshnet_variant": "deterministic",
         "evaluation_scope": "official-training-set internal development holdout",
         "official_test_status": "untouched; not evaluated by this finalizer",
         "not_for_official_test_or_main_table_claims": True,
         "epochs_per_run": EXPECTED_EPOCHS,
+        "evaluation_interval": EXPECTED_EVALUATION_INTERVAL,
+        "evaluated_checkpoints_per_run": len(expected_evaluation_epochs()),
         "seeds": seeds,
         "statistics": "mean and sample standard deviation across three seeds",
         "metrics": {
